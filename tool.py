@@ -3,7 +3,7 @@ AI Video Creator — Python Streamlit App
 Chạy: streamlit run tool.py
 """
 import streamlit as st
-import asyncio, json, os, re, uuid, base64, subprocess, shutil, time, tempfile, random
+import asyncio, json, os, re, uuid, base64, subprocess, shutil, time, tempfile, random, math
 from typing import Optional
 from pathlib import Path
 import requests
@@ -33,10 +33,16 @@ AUDIO_DIR.mkdir(exist_ok=True)
 CFG_FILE = Path.home() / ".avc_config.json"
 
 def load_cfg():
+    default_cfg = {"gemini": [], "groq": [], "pexels": [], "pixabay": "", "openai": "", "used_videos": []}
     if CFG_FILE.exists():
-        try: return json.loads(CFG_FILE.read_text())
+        try:
+            data = json.loads(CFG_FILE.read_text())
+            for k, v in default_cfg.items():
+                if k not in data:
+                    data[k] = v
+            return data
         except: pass
-    return {"gemini": [], "groq": [], "pexels": [], "pixabay": "", "openai": ""}
+    return default_cfg
 
 def save_cfg(cfg):
     CFG_FILE.write_text(json.dumps(cfg, indent=2))
@@ -45,17 +51,23 @@ if "cfg" not in st.session_state:
     st.session_state.cfg = load_cfg()
 
 # Project state (persisted in JSON)
-PROJ_FILE = Path.home() / ".avc_project.json"
+def get_proj_file():
+    mode = st.session_state.get("proj_mode", "main")
+    return Path.home() / (".avc_project_shorts.json" if mode == "shorts" else ".avc_project.json")
 
 def load_proj():
-    if PROJ_FILE.exists():
-        try: return json.loads(PROJ_FILE.read_text())
+    pf = get_proj_file()
+    if pf.exists():
+        try: return json.loads(pf.read_text())
         except: pass
     return {"script": None, "scenes": [], "step": 0}
 
 def save_proj(p):
-    PROJ_FILE.write_text(json.dumps(p, ensure_ascii=False, indent=2))
+    pf = get_proj_file()
+    pf.write_text(json.dumps(p, ensure_ascii=False, indent=2))
 
+if "proj_mode" not in st.session_state:
+    st.session_state.proj_mode = st.session_state.cfg.get("last_proj_mode", "main")
 if "proj" not in st.session_state:
     st.session_state.proj = load_proj()
 
@@ -66,7 +78,7 @@ proj = st.session_state.proj
 def call_gemini(key, prompt):
     r = requests.post(
         f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={key}",
-        json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.85, "maxOutputTokens": 8192}},
+        json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.85, "maxOutputTokens": 8192, "responseMimeType": "application/json"}},
         timeout=60,
     )
     d = r.json()
@@ -74,18 +86,44 @@ def call_gemini(key, prompt):
     return d["candidates"][0]["content"]["parts"][0]["text"].replace("```json", "").replace("```", "").strip()
 
 def call_groq_llm(key, prompt):
-    for model in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]:
-        r = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {key}"},
-            json={"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0.85, "max_tokens": 8192},
-            timeout=60,
-        )
-        d = r.json()
-        if r.status_code in (400, 404): continue
-        if not r.ok: raise Exception(d.get("error", {}).get("message", f"Groq {r.status_code}"))
-        return d["choices"][0]["message"]["content"].replace("```json", "").replace("```", "").strip()
-    raise Exception("All Groq models unavailable")
+    # Models in priority order; higher TPM models come last as ultimate fallback
+    # gemma2-9b-it has 15K TPM (vs 6K for llama models) — better for large prompts
+    models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "gemma2-9b-it"]
+    for model in models:
+        max_retries = 3
+        backoff = 15  # seconds
+        for attempt in range(max_retries):
+            r = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {key}"},
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.85,
+                    "max_tokens": 8192,
+                    "response_format": {"type": "json_object"}
+                },
+                timeout=60,
+            )
+            d = r.json()
+            if r.status_code in (400, 404):
+                break  # model not available, try next model
+            if r.status_code == 429:
+                retry_after = int(r.headers.get("retry-after", backoff))
+                if retry_after > 60:
+                    # Quota exhausted for a long time — skip this model/key entirely
+                    print(f"[Groq/{model}] Quota hết dài hạn ({retry_after}s) — chuyển model/key khác")
+                    break  # break inner retry loop → try next model
+                wait = max(retry_after, backoff)
+                print(f"[Groq/{model}] Rate limit 429 — waiting {wait}s (attempt {attempt+1}/{max_retries})...")
+                time.sleep(wait)
+                backoff = min(backoff * 2, 60)
+                continue
+            if not r.ok:
+                raise Exception(d.get("error", {}).get("message", f"Groq {r.status_code}"))
+            return d["choices"][0]["message"]["content"].replace("```json", "").replace("```", "").strip()
+    raise Exception("All Groq models unavailable after retries")
+
 
 def call_ai(prompt):
     last_err = None
@@ -96,15 +134,16 @@ def call_ai(prompt):
         except Exception as e:
             last_err = str(e)
             print(f"[Gemini] skip: {str(e)[:80]}")
-            continue  # try next key or fallback to Groq
-    # Fallback: Groq LLM (free, no billing needed)
+            continue
+    # Fallback: Groq LLM — try ALL keys before giving up
     for key in cfg.get("groq", []):
         try:
             return call_groq_llm(key, prompt)
         except Exception as e:
-            if "429" not in str(e) and "rate" not in str(e).lower():
-                raise
+            # Always skip to next key (quota, rate limit, model unavailable, etc.)
             last_err = str(e)
+            print(f"[Groq] skip key: {str(e)[:100]}")
+            continue
     if last_err:
         raise Exception(f"Tất cả key lỗi. Lỗi cuối: {last_err[:150]}")
     raise Exception("Chưa có API key! Vào Settings thêm Gemini hoặc Groq key.")
@@ -439,6 +478,10 @@ def make_ass(words, W=1920, H=1080, window=4, offset_s=0.0):
     fs    = 52 if W == 1080 else 32
     margv = 120 if W == 1080 else 70
 
+    # Auto-detect Korean characters (Hangul Syllables: 0xAC00-0xD7A3, Jamo: 0x1100-0x11FF)
+    has_ko = any(any(0xAC00 <= ord(c) <= 0xD7A3 or 0x1100 <= ord(c) <= 0x11FF for c in entry.get("word", "")) for entry in words)
+    font_name = "Apple SD Gothic Neo" if has_ko else "Arial"
+
     header = (
         f"[Script Info]\nScriptType: v4.00+\nPlayResX: {W}\nPlayResY: {H}\nWrapStyle: 0\n\n"
         "[V4+ Styles]\n"
@@ -446,7 +489,7 @@ def make_ass(words, W=1920, H=1080, window=4, offset_s=0.0):
         "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
         "Alignment, MarginL, MarginR, MarginV, Encoding\n"
         # White bold text, black outline, semi-transparent box background
-        f"Style: Default,Arial,{fs},&H00FFFFFF,&H000000FF,&H00000000,&H80000000,"
+        f"Style: Default,{font_name},{fs},&H00FFFFFF,&H000000FF,&H00000000,&H80000000,"
         f"-1,0,0,0,100,100,2,0,3,2,1,2,30,30,{margv},1\n\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
@@ -584,30 +627,68 @@ def fetch_pexels(keyword, orientation="landscape", used_urls=None):
     if not key: return None
     if used_urls is None: used_urls = set()
     
-    def _search(o):
-        url = f"https://api.pexels.com/videos/search?query={requests.utils.quote(keyword)}&per_page=15"
+    global_used = set(cfg.get("used_videos", []))
+    
+    def _search(kw, o, check_global=True):
+        url = f"https://api.pexels.com/videos/search?query={requests.utils.quote(kw)}&per_page=15"
         if o: url += f"&orientation={o}"
         r = requests.get(url, headers={"Authorization": key}, timeout=15)
         if not r.ok: return None
-        for v in r.json().get("videos", []):
+        
+        videos = r.json().get("videos", [])
+        # Shuffle results to avoid choosing the same first video every time
+        random.shuffle(videos)
+        
+        for v in videos:
             files = v.get("video_files", [])
             if not files: continue
             valid_files = [f for f in files if (f.get("width", 0) >= 1080 or f.get("height", 0) >= 1080)]
             if not valid_files: valid_files = files
             valid_files = sorted(valid_files, key=lambda x: x.get("width", 0) * x.get("height", 0), reverse=True)
             f = valid_files[0]
-            if f and f["link"] not in used_urls:
-                return f["link"]
+            if not f: continue
+            
+            link = f["link"]
+            if link in used_urls:
+                continue
+            if check_global and link in global_used:
+                continue
+                
+            # Save to global config
+            if "used_videos" not in cfg:
+                cfg["used_videos"] = []
+            if link not in cfg["used_videos"]:
+                cfg["used_videos"].append(link)
+                if len(cfg["used_videos"]) > 1000:
+                    cfg["used_videos"].pop(0)
+                save_cfg(cfg)
+            return link
         return None
         
-    res = _search(orientation)
+    # Phase 1: Try to search using global deduplication
+    res = _search(keyword, orientation, check_global=True)
     if not res and orientation != "":
-        # Fallback to any orientation if preferred one yields no results
-        res = _search("")
+        res = _search(keyword, "", check_global=True)
+    if not res:
+        fallback_kw = random.choice(["nature", "landscape", "cityscape", "abstract", "technology", "scenery"])
+        res = _search(fallback_kw, orientation, check_global=True)
+        if not res and orientation != "":
+            res = _search(fallback_kw, "", check_global=True)
+            
+    # Phase 2: If no new video was found (all were already used), relax global constraint to avoid gray screen
+    if not res:
+        res = _search(keyword, orientation, check_global=False)
+        if not res and orientation != "":
+            res = _search(keyword, "", check_global=False)
+        if not res:
+            fallback_kw = random.choice(["nature", "landscape", "cityscape", "abstract", "technology", "scenery"])
+            res = _search(fallback_kw, orientation, check_global=False)
+            if not res and orientation != "":
+                res = _search(fallback_kw, "", check_global=False)
+                
     return res
 
 def search_pexels_videos(keyword, orientation="landscape"):
-    import random
     key = (cfg.get("pexels") or [None])[0]
     if not key: return []
     
@@ -639,6 +720,128 @@ def search_pexels_videos(keyword, orientation="landscape"):
         print(f"[Pexels Search] Error: {e}")
         return []
 
+def fetch_pixabay(keyword, orientation="landscape", used_urls=None):
+    key = cfg.get("pixabay", "")
+    if not key: return None
+    if used_urls is None: used_urls = set()
+    global_used = set(cfg.get("used_videos", []))
+
+    def _search(kw, o, check_global=True):
+        url = f"https://pixabay.com/api/videos/?key={key}&q={requests.utils.quote(kw)}&per_page=30"
+        try:
+            r = requests.get(url, timeout=15)
+            if not r.ok: return None
+            
+            videos = r.json().get("hits", [])
+            random.shuffle(videos)
+            
+            for v in videos:
+                if not isinstance(v.get("videos"), dict): continue
+                res_list = list(v["videos"].values())
+                res_list = [r for r in res_list if r.get("url") and r.get("width") and r.get("height")]
+                if not res_list: continue
+                
+                w = res_list[0]["width"]
+                h = res_list[0]["height"]
+                is_landscape = w >= h
+                
+                if o == "landscape" and not is_landscape: continue
+                if o == "portrait" and is_landscape: continue
+                
+                res_list = sorted(res_list, key=lambda x: x.get("width", 0) * x.get("height", 0), reverse=True)
+                link = res_list[0]["url"]
+                
+                if link in used_urls: continue
+                if check_global and link in global_used: continue
+                    
+                if "used_videos" not in cfg: cfg["used_videos"] = []
+                if link not in cfg["used_videos"]:
+                    cfg["used_videos"].append(link)
+                    if len(cfg["used_videos"]) > 1000:
+                        cfg["used_videos"].pop(0)
+                    save_cfg(cfg)
+                return link
+            return None
+        except Exception as e:
+            print(f"[Pixabay] {e}")
+            return None
+            
+    res = _search(keyword, orientation, check_global=True)
+    if not res and orientation != "": res = _search(keyword, "", check_global=True)
+    if not res:
+        fallback_kw = random.choice(["nature", "landscape", "cityscape", "abstract", "technology", "scenery"])
+        res = _search(fallback_kw, orientation, check_global=True)
+        if not res and orientation != "": res = _search(fallback_kw, "", check_global=True)
+            
+    if not res:
+        res = _search(keyword, orientation, check_global=False)
+        if not res and orientation != "": res = _search(keyword, "", check_global=False)
+        if not res:
+            fallback_kw = random.choice(["nature", "landscape", "cityscape", "abstract", "technology", "scenery"])
+            res = _search(fallback_kw, orientation, check_global=False)
+            if not res and orientation != "": res = _search(fallback_kw, "", check_global=False)
+                
+    return res
+
+def search_pixabay_videos(keyword, orientation="landscape"):
+    key = cfg.get("pixabay", "")
+    if not key: return []
+    url = f"https://pixabay.com/api/videos/?key={key}&q={requests.utils.quote(keyword)}&per_page=30"
+    try:
+        r = requests.get(url, timeout=15)
+        if not r.ok: return []
+        results = []
+        videos = r.json().get("hits", [])
+        random.shuffle(videos)
+        for v in videos:
+            if not isinstance(v.get("videos"), dict): continue
+            res_list = list(v["videos"].values())
+            res_list = [r for r in res_list if r.get("url") and r.get("width") and r.get("height")]
+            if not res_list: continue
+            
+            w = res_list[0]["width"]
+            h = res_list[0]["height"]
+            is_landscape = w >= h
+            if orientation == "landscape" and not is_landscape: continue
+            if orientation == "portrait" and is_landscape: continue
+                
+            res_list = sorted(res_list, key=lambda x: x.get("width", 0) * x.get("height", 0), reverse=True)
+            best_res = res_list[0]
+            
+            results.append({
+                "id": str(v["id"]),
+                "url": best_res["url"],
+                "image": f"https://i.vimeocdn.com/video/{v.get('picture_id')}_640x360.jpg",
+                "duration": v.get("duration", 0)
+            })
+        return results
+    except Exception as e:
+        print(f"[Pixabay Search] Error: {e}")
+        return []
+
+def fetch_stock_video(keyword, orientation="landscape", used_urls=None):
+    providers = []
+    if (cfg.get("pexels") or [None])[0]: providers.append("pexels")
+    if cfg.get("pixabay", ""): providers.append("pixabay")
+    if not providers: return None
+    
+    random.shuffle(providers)
+    for p in providers:
+        url = fetch_pexels(keyword, orientation, used_urls) if p == "pexels" else fetch_pixabay(keyword, orientation, used_urls)
+        if url: return url
+    return None
+
+def search_stock_videos(keyword, orientation="landscape"):
+    providers = []
+    if (cfg.get("pexels") or [None])[0]: providers.append("pexels")
+    if cfg.get("pixabay", ""): providers.append("pixabay")
+    
+    results = []
+    if "pexels" in providers: results.extend(search_pexels_videos(keyword, orientation))
+    if "pixabay" in providers: results.extend(search_pixabay_videos(keyword, orientation))
+    random.shuffle(results)
+    return results[:30]
+
 def download_url(url, dest):
     r = requests.get(url, timeout=60, stream=True, headers={"User-Agent": "Mozilla/5.0"})
     r.raise_for_status()
@@ -660,6 +863,22 @@ def has_subtitles_filter():
 
 HAS_SUB = has_subtitles_filter()
 
+def save_and_next_scene(idx_val, n_text, n_kw, n_dur, n_mode, n_start=0.0):
+    proj = load_proj()
+    if idx_val < len(proj.get("scenes", [])):
+        proj["scenes"][idx_val]["text"] = n_text
+        proj["scenes"][idx_val]["keyword"] = n_kw
+        proj["scenes"][idx_val]["duration"] = n_dur
+        proj["scenes"][idx_val]["videoTrimMode"] = n_mode
+        if n_mode == "custom":
+            proj["scenes"][idx_val]["videoTrimStart"] = n_start
+        proj["scenes"][idx_val]["completed"] = True
+        
+        if idx_val < len(proj["scenes"]) - 1:
+            st.session_state.selectbox_scene_active = idx_val + 1
+            proj["active_scene_idx"] = idx_val + 1
+        save_proj(proj)
+
 # ── UI ────────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
@@ -667,21 +886,35 @@ st.markdown("""
 .stButton button { width: 100%; }
 
 /* Tạo thanh cuộn riêng biệt cho cột Kết Quả (cột số 2) */
-div[data-testid="stHorizontalBlock"] > div:nth-child(2) {
+div[data-testid="stTabContent"] > div > div[data-testid="stHorizontalBlock"] > div:nth-child(2) {
     height: calc(100vh - 120px) !important;
     overflow-y: auto !important;
     padding-right: 15px !important;
 }
 /* Làm đẹp thanh cuộn */
-div[data-testid="stHorizontalBlock"] > div:nth-child(2)::-webkit-scrollbar {
+div[data-testid="stTabContent"] > div > div[data-testid="stHorizontalBlock"] > div:nth-child(2)::-webkit-scrollbar {
     width: 6px;
 }
-div[data-testid="stHorizontalBlock"] > div:nth-child(2)::-webkit-scrollbar-track {
+div[data-testid="stTabContent"] > div > div[data-testid="stHorizontalBlock"] > div:nth-child(2)::-webkit-scrollbar-track {
     background: transparent;
 }
-div[data-testid="stHorizontalBlock"] > div:nth-child(2)::-webkit-scrollbar-thumb {
+div[data-testid="stTabContent"] > div > div[data-testid="stHorizontalBlock"] > div:nth-child(2)::-webkit-scrollbar-thumb {
     background-color: #555;
     border-radius: 10px;
+}
+
+/* Giảm khoảng trắng thừa cho giao diện kịch bản gọn gàng */
+div[data-testid="stExpanderDetails"] {
+    padding: 0.6rem 0.8rem 0.8rem 0.8rem !important;
+}
+div[data-testid="stVerticalBlock"] > div {
+    gap: 0.4rem !important;
+}
+div.element-container {
+    margin-bottom: 0.15rem !important;
+}
+hr {
+    margin: 0.6rem 0 !important;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -745,6 +978,25 @@ with tab_settings:
 # MAIN PIPELINE TAB
 # ════════════════════════════════════════════════════════════
 with tab_main:
+    st.markdown("### 🗂️ Quản lý Dự án")
+    default_mode_idx = 1 if st.session_state.proj_mode == "shorts" else 0
+    mode_selection = st.radio(
+        "Loại Video đang làm:", 
+        ["Video Chính (Dài)", "Video Shorts (Ăn theo)"], 
+        index=default_mode_idx,
+        horizontal=True, 
+        help="Tách riêng 2 kịch bản để dễ dàng quản lý."
+    )
+    new_mode = "shorts" if "Shorts" in mode_selection else "main"
+    if st.session_state.get("proj_mode") != new_mode:
+        st.session_state.proj_mode = new_mode
+        cfg["last_proj_mode"] = new_mode
+        save_cfg(cfg)
+        st.session_state.proj = load_proj()
+        st.rerun()
+
+    proj = st.session_state.proj
+
     col_left, col_right = st.columns([1, 1.6])
 
     with col_left:
@@ -755,7 +1007,8 @@ with tab_main:
             "business","history","psychology","travel","food"
         ])
         custom = st.text_area("Hoặc nhập mô tả chi tiết (tùy chỉnh)", placeholder="Ví dụ:\nChủ đề: 한국 집값\nNội dung chính:\n- ...\nTôn màu: ...", height=150)
-        duration = st.select_slider("⏱️ Tổng thời lượng (giây)", [30, 45, 60, 90, 120, 180, 300, 600], value=60)
+        default_dur = 60 if new_mode == "shorts" else 600
+        duration = st.number_input("⏱️ Tổng thời lượng (giây)", min_value=15, max_value=18000, value=default_dur, step=30, help="Nhập thời lượng video tính bằng giây (VD: 600 = 10 phút, 1800 = 30 phút)")
         target_sec_per_scene = st.number_input("⏳ Nhịp độ 1 cảnh (giây)", min_value=3, max_value=30, value=7, help="Tăng số này nếu muốn AI viết câu thoại dài hơn, đỡ bị vụn vặt.")
         style = st.selectbox("🎭 Phong cách", ["educational","storytelling","listicle","documentary","motivational"])
 
@@ -838,7 +1091,8 @@ with tab_main:
             }
             voice_cfg_key = _legacy_map.get(voice, "en-US")
 
-        aspect = st.radio("📐 Tỉ lệ", ["16:9 (YouTube)","9:16 (Shorts/TikTok)"], horizontal=True)
+        default_aspect = 1 if new_mode == "shorts" else 0
+        aspect = st.radio("📐 Tỉ lệ", ["16:9 (YouTube)","9:16 (Shorts/TikTok)"], index=default_aspect, horizontal=True)
         show_sub = st.checkbox("💬 Thêm phụ đề (sub từng chữ)", value=False)
 
         st.markdown("**🎵 Nhạc nền (Tùy chọn)**")
@@ -862,6 +1116,9 @@ with tab_main:
         st.divider()
 
         gen_script = st.button("📝 1. Tạo Kịch Bản", type="primary") if not proj.get("script") else None
+        
+
+
         run_all    = st.button("🚀 2. Tạo Video (Footage + TTS + Render)", type="primary") if proj.get("script") else None
         run_render = st.button("🎞️ 3. Chỉ Render Video") if proj.get("scenes") else None
         reset_btn  = st.button("🗑️ Xóa & làm lại") if proj.get("script") else None
@@ -885,7 +1142,9 @@ with tab_main:
 
         # ── Full pipeline ──────────────────────────────────────────────────
         if gen_script or run_all or run_render:
+
             topic = custom.strip() or niche
+
             voice_id = "Fritz-PlayAI" if "Fritz" in voice else "Celeste-PlayAI"
             work = TMP / uuid.uuid4().hex
             work.mkdir(exist_ok=True)
@@ -895,121 +1154,204 @@ with tab_main:
                 if gen_script:
                     log("📝 Tạo kịch bản AI (retention-optimized)...")
                     sc = max(2, round(duration / target_sec_per_scene))
-                    # Seed chống trùng nội dung: timestamp + UUID fragment + topic hash
-                    # → ~18 chữ số entropy, cực kỳ khó trùng dù publish cùng topic mỗi ngày
-                    import hashlib as _hs
-                    _ts   = str(int(time.time() * 1000))          # ms epoch
-                    _uid  = uuid.uuid4().hex[:8]                  # 8 hex random
-                    _thash = _hs.md5(f"{topic}{lang}{style}".encode()).hexdigest()[:6]  # topic fingerprint
-                    seed  = f"{_ts}-{_uid}-{_thash}"             # unique per generation
-                    # Tốc độ đọc khoảng 3.5 - 4 từ / giây (Voice AI thường đọc khá nhanh) -> cảnh 5s cần ~18-20 từ
-                    words_per_scene = max(18, round(target_sec_per_scene * 3.8))
 
-                    # Map hook style to AI instructions
+                    # Seed chống trùng nội dung
+                    import hashlib as _hs
+                    _ts    = str(int(time.time() * 1000))
+                    _uid   = uuid.uuid4().hex[:8]
+                    _thash = _hs.md5(f"{topic}{lang}{style}".encode()).hexdigest()[:6]
+                    seed   = f"{_ts}-{_uid}-{_thash}"
+
+                    rate_val         = float(tts_rate)
+                    words_per_sec    = 3.5 * rate_val
+                    total_words      = max(40, round((duration + 2) * words_per_sec))
+                    words_per_scene  = max(10, round(target_sec_per_scene * words_per_sec))
+
                     hook_map = {
                         "🤯 Shock & Awe — Con số / sự thật gây sốc":
-                            "Start with a SHOCKING statistic or fact that feels unbelievable. Example: '99% of people do X wrong...' or 'Scientists just discovered...' Make viewer think WTF.",
+                            "Start with a SHOCKING statistic or fact. Example: '99% of people do X wrong...' Make viewer think WTF.",
                         "❓ Curiosity Gap — Câu hỏi bỏ lửng tạo tò mò":
-                            "Open with a question that can ONLY be answered by watching the whole video. Tease the answer but DON'T give it yet. Example: 'What if I told you the thing you do every day is actually...' Leave an irresistible knowledge gap.",
+                            "Open with a question only answered by finishing the video. Leave an irresistible knowledge gap.",
                         "🔥 Controversial — Phát biểu gây tranh cãi":
-                            "Start with a bold, polarizing statement that makes people either strongly agree or disagree. This triggers emotional response and comment impulse. Example: '[Common belief] is actually completely wrong and here's proof.'",
+                            "Start with a bold polarizing statement. Example: '[Common belief] is completely wrong and here's proof.'",
                         "⚠️ Warning / Fear — Cảnh báo, nguy cơ":
-                            "Open with an urgent warning or threat the viewer didn't know about. Trigger loss aversion. Example: 'Stop doing this immediately — it's silently damaging your...'",
+                            "Open with an urgent warning. Example: 'Stop doing this immediately — it's silently damaging your...'",
                         "🤫 Secret / Insider — Bí mật ít người biết":
-                            "Position the video as revealing exclusive insider info. Use 'nobody talks about this', 'this is what they don't want you to know', 'I discovered a secret that...'",
+                            "Position as revealing exclusive insider info. Use 'nobody talks about this' or 'what they don't want you to know'.",
                         "🎭 Story / Relatable — Câu chuyện cá nhân":
-                            "Start in the middle of an interesting personal story or a relatable situation. Use 'in medias res' — drop the viewer into the most exciting moment first.",
+                            "Start in the middle of an interesting personal story. Use 'in medias res'.",
                         "📣 Bold Claim — Tuyên bố mạnh mẽ":
-                            "Make an audacious, specific, big promise in the first sentence. Example: 'I increased my income 10x in 3 months using this one technique.'",
+                            "Make an audacious specific big promise in the first sentence.",
                         "🎲 Random — AI tự chọn tốt nhất":
-                            "Choose the most effective hook type for this specific topic and audience. Optimize for maximum curiosity and retention.",
+                            "Choose the most effective hook type for this topic and audience.",
                     }
                     hook_instruction = hook_map.get(hook_style, hook_map["🎲 Random — AI tự chọn tốt nhất"])
 
                     retention_rules = ""
                     if pattern_interrupt:
-                        retention_rules += """
-- PATTERN INTERRUPT: Every 2-3 scenes, insert a surprising twist, counter-intuitive fact, or tonal shift to re-engage attention."""
+                        retention_rules += "\n- PATTERN INTERRUPT: Every 2-3 scenes insert a surprising twist or tonal shift."
                     if add_loop_teaser:
-                        retention_refs = """
-- LOOP ENDING: The LAST scene must subtly call back to the opening hook, creating a satisfying loop that makes viewers want to rewatch."""
-                        retention_rules += retention_refs
+                        retention_rules += "\n- LOOP ENDING: The LAST scene must call back to the opening hook."
                     if cta_style != "Không có":
-                        retention_rules += f"""
-- CTA: Include a natural, non-pushy call-to-action in the last 3 seconds: "{cta_style}"."""
-
-                    # Nâng mục tiêu số chữ lên cao hơn để chắc chắn video KHÔNG BAO GIỜ bị ngắn hơn thời gian yêu cầu
-                    target_duration_padded = duration + 5 
-                    total_words = max(80, round(target_duration_padded * 3.8))
+                        retention_rules += f'\n- CTA: Add a natural call-to-action: "{cta_style}".'
+                    retention_rules += '\n- NEVER end with "Thank you for watching", "감사합니다", or "Cảm ơn".'
 
                     if lang == 'Korean':
-                        keyword_instruction = "- keyword: 1-3 plain English words for Pexels video search. CRITICAL: For ANY scene involving people, streets, lifestyle, or culture, you MUST include 'Asian', 'Korea', 'Korean', or 'Seoul' in the keyword (e.g., 'Asian office worker', 'Seoul street', 'Korean food'). NO URLs."
+                        lang_style_instruction = "For scenes with people/streets/lifestyle, use keywords with 'Korean', 'Korea', or 'Seoul'."
                     elif lang == 'Vietnamese':
-                        keyword_instruction = "- keyword: 1-3 plain English words for Pexels video search. CRITICAL: For ANY scene involving people, streets, lifestyle, or culture, you MUST include 'Asian', 'Vietnam', or 'Vietnamese' in the keyword (e.g., 'Asian office worker', 'Vietnam street', 'Asian student'). NO URLs."
+                        lang_style_instruction = "For scenes with people/streets/lifestyle, use keywords with 'Vietnamese', 'Vietnam', or 'Asian'."
                     else:
-                        keyword_instruction = "- keyword: 1-3 plain English words for Pexels video search. NO URLs."
+                        lang_style_instruction = "Match keywords to the topic's culture naturally."
 
-                    raw = call_ai(f"""[seed:{seed}] You are a viral short-form video expert. Create a RETENTION-OPTIMIZED {style} video script about "{topic}" in {lang}.
+                    keyword_instruction = (
+                        f"- keyword: A highly descriptive 2-4 word English search phrase for Pexels. "
+                        f"Must be plain English, represent the scene's visual. Avoid single generic words. "
+                        f"{lang_style_instruction} NO URLs."
+                    )
 
-=== LANGUAGE INSTRUCTIONS ===
-{(
-    'Write ALL narration text in natural, conversational Korean (한국어). Use informal but respectful speech level (해요체). Optimize for Korean audiences on platforms like YouTube, TikTok KR, and Instagram Reels.'
-    if lang == 'Korean' else
-    'Write ALL narration text in natural Vietnamese (tiếng Việt). Use colloquial, engaging language suitable for Vietnamese social media audiences.'
-    if lang == 'Vietnamese' else
-    'Write ALL narration text in clear, engaging English.'
-)}
+                    if custom.strip():
+                        # Full instructions for batch 1 (first call)
+                        topic_instruction = (
+                            f"based on the following detailed instructions:\n\n<USER_INSTRUCTIONS>\n{custom.strip()}\n</USER_INSTRUCTIONS>\n\n"
+                            f"Please integrate these instructions while strictly adhering to the JSON format."
+                        )
+                        # Short summary for continuation batches (avoids exceeding TPM token limit)
+                        _custom_short = custom.strip()[:300].rsplit(' ', 1)[0] + "..." if len(custom.strip()) > 300 else custom.strip()
+                        topic_instruction_short = f'following the topic/style: "{_custom_short}"'
+                    else:
+                        topic_instruction = f'about "{topic}"'
+                        topic_instruction_short = topic_instruction
+                    lang_upper = lang.upper()
 
-=== HOOK STRATEGY (FIRST 3 SECONDS — MOST CRITICAL) ===
-{hook_instruction}
-The first sentence of scene 1 MUST be so compelling that viewers CANNOT scroll away.
-Never start with "In this video..." or "Today we're going to..."
+                    # ── CHUNKED GENERATION: ~15 cảnh/batch để tránh vượt 64K output token ──
+                    BATCH_SIZE          = 15
+                    total_scenes_needed = sc
+                    all_scene_data      = []
+                    video_title         = ""
+                    video_description   = ""
+                    video_tags          = []
+                    prev_summary        = ""
+                    batch_num           = 0
+                    scene_cursor        = 0
 
-=== RETENTION STRUCTURE ===
-Total video duration MUST BE AT LEAST {duration} seconds.
-Total script word count MUST BE AROUND {total_words} words (no less than {total_words - 15}, no more than {total_words + 20}).
-You must write exactly {sc} scenes.
-- Scene 1 (HOOK): Explosive opening — apply the hook strategy above.
-- Scene 2 (AMPLIFY): Deepen the curiosity / tension from the hook. Don't resolve it yet.
-- Scenes 3 to {sc-1} (CONTENT): Deliver value in fast, punchy bursts. Each scene = one key insight.
-- Scene {sc} (PAYOFF + CTA): Satisfying conclusion + call to action.
-{retention_rules}
+                    log(f"  📊 Tổng cảnh cần tạo: {total_scenes_needed} (~{math.ceil(total_scenes_needed / BATCH_SIZE)} batch)")
 
-=== WRITING RULES ===
-- CRITICAL — Word count: Each scene narration MUST contain around {words_per_scene + 2} words. DO NOT write ultra-short scenes (e.g. 3-4 words) unless it's a specific stylistic choice.
-- Keep sentences punchy, conversational, and active. Write complete, full sentences.
-- Use conversational language, active voice, power words. Write complete, full sentences.
-- Create OPEN LOOPS — tease what's coming next to prevent drop-off.
-{keyword_instruction}
+                    while scene_cursor < total_scenes_needed:
+                        batch_start   = scene_cursor + 1
+                        batch_end     = min(scene_cursor + BATCH_SIZE, total_scenes_needed)
+                        batch_count   = batch_end - scene_cursor
+                        is_first      = (scene_cursor == 0)
+                        is_last       = (batch_end >= total_scenes_needed)
+                        batch_num    += 1
 
-Return ONLY valid JSON:
-{{"title":"...","description":"...","tags":["t1","t2"],"scenes":[{{"id":1,"text":"narration text","keyword":"plain english words","retention_note":"why this keeps viewers watching"}}]}}""")                    
-                    try:
-                        script = parse_json_robust(raw)
-                    except (json.JSONDecodeError, ValueError) as _je:
-                        log(f"❌ AI trả về JSON lỗi: {_je}")
-                        log(f"   Raw (300 ký tự đầu): {raw[:300]}")
-                        raise
+                        log(f"  📋 Batch {batch_num}: cảnh {batch_start}–{batch_end} ({batch_count} cảnh)...")
+
+                        lang_rule = (
+                            "Write in natural Korean (해요체)." if lang == "Korean"
+                            else "Write in natural Vietnamese (tiếng Việt)." if lang == "Vietnamese"
+                            else "Write in clear, engaging English."
+                        )
+
+                        if is_first:
+                            context_block = (
+                                f"=== VIDEO OVERVIEW ===\n"
+                                f"Create a COMPLETE {style} video script {topic_instruction} in {lang}.\n"
+                                f"Total: {total_scenes_needed} scenes, ~{duration} seconds.\n"
+                                f"This is PART 1 (scenes {batch_start}–{batch_end} of {total_scenes_needed}).\n\n"
+                                f"=== HOOK STRATEGY (FIRST 3 SECONDS) ===\n"
+                                f"{hook_instruction}\n"
+                                f"First sentence MUST be irresistible. Never start with 'In this video...' or 'Today we...'\n\n"
+                                f"=== RETENTION RULES ===\n{retention_rules}"
+                            )
+                            format_str = (
+                                f'{{"title":"video title in {lang}","description":"video description in {lang}",'
+                                f'"tags":["t1","t2"],"scenes":[{{"id":1,"text":"narration STRICTLY in {lang}",'
+                                f'"keyword":"plain english","retention_note":"reason"}}]}}'
+                            )
+                        else:
+                            end_note = ("FINAL BATCH — apply loop ending & CTA now." if is_last else "Keep open loops.")
+                            context_block = (
+                                f"=== CONTINUATION (Batch {batch_num}) ===\n"
+                                f"Write scenes {batch_start}–{batch_end} of {total_scenes_needed} for a {style} video {topic_instruction_short} in {lang}.\n"
+                                f"Previous batch ended with: \"{prev_summary}\"\n"
+                                f"Continue naturally. {end_note}\n"
+                                f"{retention_rules if is_last else ''}"
+                            )
+                            format_str = (
+                                f'{{"scenes":[{{"id":{batch_start},"text":"narration STRICTLY in {lang}",'
+                                f'"keyword":"plain english","retention_note":"reason"}}]}}'
+                            )
+
+                        batch_prompt = (
+                            f"[seed:{seed}-b{batch_num}] You are a viral video script writer.\n"
+                            f"CRITICAL: All \"text\" narration fields MUST be in {lang} ({lang_upper}). {lang_rule}\n\n"
+                            f"{context_block}\n\n"
+                            f"=== THIS BATCH ===\n"
+                            f"Write EXACTLY {batch_count} scenes (IDs {batch_start} to {batch_end}).\n"
+                            f"Each scene narration: ~{words_per_scene} words (~{target_sec_per_scene}s spoken). Min 15 words per scene.\n"
+                            f"{keyword_instruction}\n\n"
+                            f"Return ONLY valid JSON:\n{format_str}"
+                        )
+
+                        raw_batch = call_ai(batch_prompt)
+
+                        try:
+                            parsed = parse_json_robust(raw_batch)
+                        except (json.JSONDecodeError, ValueError) as _je:
+                            log(f"  ⚠️ Batch {batch_num} JSON lỗi: {_je} — bỏ qua batch này")
+                            scene_cursor += batch_count
+                            continue
+
+                        if is_first:
+                            video_title       = parsed.get("title", topic)
+                            video_description = parsed.get("description", "")
+                            video_tags        = parsed.get("tags", [])
+
+                        batch_scenes = parsed.get("scenes", [])
+                        if batch_scenes:
+                            for bi, bsc in enumerate(batch_scenes):
+                                bsc["id"] = scene_cursor + bi + 1
+                            all_scene_data.extend(batch_scenes)
+                            last_text    = batch_scenes[-1].get("text", "")
+                            prev_summary = last_text[:200] if last_text else ""
+                            log(f"  ✅ Batch {batch_num}: +{len(batch_scenes)} cảnh (tổng: {len(all_scene_data)})")
+                        else:
+                            log(f"  ⚠️ Batch {batch_num} trả về 0 cảnh")
+
+                        scene_cursor += batch_count
+
+                        # Delay giữa các batch để tránh Groq rate limit (tokens/phút)
+                        if scene_cursor < total_scenes_needed:
+                            log(f"  ⏳ Đợi 12s trước batch tiếp theo (tránh rate limit)...")
+                            time.sleep(12)
+
+                    script = {
+                        "title":       video_title,
+                        "description": video_description,
+                        "tags":        video_tags,
+                        "scenes":      all_scene_data,
+                    }
+
                     vid_orientation = "portrait" if "9:16" in aspect else "landscape"
                     scenes = []
                     used_pexels_urls = set()
                     for sc_data in script["scenes"]:
-                        url = fetch_pexels(clean_keyword(sc_data["keyword"]), orientation=vid_orientation, used_urls=used_pexels_urls)
+                        url = fetch_stock_video(clean_keyword(sc_data["keyword"]), orientation=vid_orientation, used_urls=used_pexels_urls)
                         if url:
                             used_pexels_urls.add(url)
                         scenes.append({
-                            "id": sc_data["id"],
-                            "text": sc_data["text"],
-                            "keyword": sc_data["keyword"],
+                            "id":       sc_data["id"],
+                            "text":     sc_data["text"],
+                            "keyword":  sc_data["keyword"],
                             "videoUrl": url,
                             "audioDone": False,
-                            "duration": round(max(3.0, len(sc_data["text"].split()) / 2.5), 1), # Ước tính ban đầu, sẽ update chính xác ở Step 3
+                            "duration": round(max(3.0, len(sc_data["text"].split()) / 2.5), 1),
                         })
                     proj.update({"script": script, "scenes": scenes, "step": 1})
                     save_proj(proj)
-                    log(f'✅ Kịch bản: "{script["title"]}" — {len(scenes)} cảnh')
+                    log(f'✅ Kịch bản: "{script["title"]}" — {len(scenes)} cảnh ({batch_num} batch)')
 
-                    # ── Tạo Thumbnail (OpenAI DALL-E 3 → Gemini Imagen fallback) ──
+                    # ── Tạo Thumbnail ──
                     log("🖼️ Đang tạo thumbnail (OpenAI DALL-E 3)...")
                     gemini_key = (cfg.get("gemini") or [None])[0]
                     openai_key = cfg.get("openai", "") or None
@@ -1038,7 +1380,7 @@ Return ONLY valid JSON:
                     for i, s in enumerate(scenes):
                         if not s.get("customVid") and not s.get("videoUrl"):
                             log(f"  Cảnh {i+1}/{len(scenes)}: {s['keyword']}")
-                            url = fetch_pexels(clean_keyword(s["keyword"]), orientation=vid_orientation, used_urls=used_urls_step2)
+                            url = fetch_stock_video(clean_keyword(s["keyword"]), orientation=vid_orientation, used_urls=used_urls_step2)
                             if url:
                                 used_urls_step2.add(url)
                             scenes[i]["videoUrl"] = url
@@ -1082,17 +1424,24 @@ Return ONLY valid JSON:
                             
                             if not actual_dur:
                                 try:
-                                    from moviepy.editor import AudioFileClip
-                                    with AudioFileClip(str(audio_path)) as ac:
-                                        actual_dur = ac.duration
+                                    probe = subprocess.run(
+                                        [FFMPEG, "-i", str(audio_path), "-f", "null", "-"],
+                                        capture_output=True, text=True
+                                    )
+                                    for line in probe.stderr.split("\n"):
+                                        if "Duration:" in line:
+                                            ts = line.split("Duration:")[1].split(",")[0].strip()
+                                            h, m, sec = ts.split(":")
+                                            actual_dur = int(h)*3600 + int(m)*60 + float(sec)
+                                            break
                                 except Exception as e:
                                     pass
                                     
                             aud_dur = actual_dur if (actual_dur and actual_dur > 0) else max(3.0, len(s["text"].split()) / 2.5)
                             scenes[i]["audioDur"] = aud_dur
                             
-                            # LUÔN LUÔN set thời lượng cảnh bằng chính xác thời lượng giọng nói!
-                            scenes[i]["duration"] = round(aud_dur, 1)
+                            # LUÔN LUÔN set thời lượng cảnh bằng chính xác thời lượng giọng nói + 0.4s đệm (tránh ngắt đuôi)
+                            scenes[i]["duration"] = round(aud_dur + 0.4, 1)
                             
                             log(f"  ✅ Audio cảnh {i+1} ({aud_dur:.1f}s → set video {scenes[i]['duration']}s)" + (" + sub" if scenes[i].get('srtFile') else ""))
                         else:
@@ -1158,13 +1507,13 @@ Return ONLY valid JSON:
                         log(f"  📥 Dùng video tải lên tùy chỉnh: {Path(custom_vid).name}")
                     else:
                         if not video_url:
-                            log(f"  🔍 Không có URL, tìm Pexels [{vid_orientation}]: {s.get('keyword','')}")
-                            video_url = fetch_pexels(clean_keyword(s.get("keyword", "")), orientation=vid_orientation, used_urls=used_urls_render) or ""
+                            log(f"  🔍 Không có URL, tìm Stock Video [{vid_orientation}]: {s.get('keyword','')}")
+                            video_url = fetch_stock_video(clean_keyword(s.get("keyword", "")), orientation=vid_orientation, used_urls=used_urls_render) or ""
                             if video_url:
                                 used_urls_render.add(video_url)
-                                log(f"  ✅ Pexels trả về URL")
+                                log(f"  ✅ Stock Video trả về URL")
                             else:
-                                log(f"  ⚠️ Pexels không tìm thấy video (kiểm tra API key trong Settings)")
+                                log(f"  ⚠️ Stock Video không tìm thấy video (kiểm tra API key trong Settings)")
 
                         if video_url:
                             try:
@@ -1176,7 +1525,7 @@ Return ONLY valid JSON:
                                     log(f"  ⚠️ File video quá nhỏ ({size}B), bỏ qua")
                             except Exception as e:
                                 log(f"  ⚠️ Tải thất bại: {str(e)[:80]} — tìm lại...")
-                                new_url = fetch_pexels(clean_keyword(s.get("keyword", "")), orientation=vid_orientation, used_urls=used_urls_render) or ""
+                                new_url = fetch_stock_video(clean_keyword(s.get("keyword", "")), orientation=vid_orientation, used_urls=used_urls_render) or ""
                                 if new_url and new_url != video_url:
                                     used_urls_render.add(new_url)
                                     try:
@@ -1260,10 +1609,33 @@ Return ONLY valid JSON:
                         
                         if has_vid:
                             video_clip = VideoFileClip(str(vid_path))
-                            # Loop video nếu ngắn hơn audio
-                            if video_clip.duration < exact_dur:
+                            vid_len = video_clip.duration
+                            trim_mode = s.get("videoTrimMode", "start")
+                            
+                            if vid_len < exact_dur:
+                                log(f"  ⚠️ Video ngắn hơn cảnh ({vid_len:.1f}s < {exact_dur:.1f}s) -> lặp video")
                                 video_clip = video_clip.fx(vfx.loop, duration=exact_dur)
-                            video_clip = video_clip.subclip(0, exact_dur)
+                                video_clip = video_clip.subclip(0, exact_dur)
+                            else:
+                                if trim_mode == "start":
+                                    start_time = 0.0
+                                elif trim_mode == "middle":
+                                    start_time = max(0.0, (vid_len - exact_dur) / 2.0)
+                                elif trim_mode == "end":
+                                    start_time = max(0.0, vid_len - exact_dur)
+                                elif trim_mode == "random":
+                                    max_start = max(0.0, vid_len - exact_dur)
+                                    start_time = random.uniform(0.0, max_start)
+                                elif trim_mode == "custom":
+                                    custom_start = float(s.get("videoTrimStart", 0.0))
+                                    max_start = max(0.0, vid_len - exact_dur)
+                                    start_time = min(custom_start, max_start)
+                                    start_time = max(0.0, start_time)
+                                else:
+                                    start_time = 0.0
+                                    
+                                log(f"  🎬 Trim video ({trim_mode}): từ {start_time:.1f}s -> {start_time + exact_dur:.1f}s (tổng {vid_len:.1f}s)")
+                                video_clip = video_clip.subclip(start_time, start_time + exact_dur)
                             
                             # Cắt/Scale để vừa WxH (1080x1920) không bị méo
                             vid_ratio = video_clip.w / video_clip.h
@@ -1416,105 +1788,275 @@ Return ONLY valid JSON:
             st.markdown("### 📝 Duyệt & Chỉnh Sửa Kịch Bản")
             st.info("Sửa trực tiếp nội dung kịch bản hoặc từ khóa tìm video (keyword) ở dưới. Hệ thống sẽ lưu tự động.")
             
+            scenes = proj.get("scenes", [])
+            total_scenes = len(scenes)
             edited = False
-            for i, scene in enumerate(proj.get("scenes", [])):
-                scene_data = s.get("scenes", [])
-                note = ""
-                if i < len(scene_data) and isinstance(scene_data[i], dict):
-                    note = scene_data[i].get("retention_note", "")
+            
+            if total_scenes > 0:
+                # Progress Bar
+                completed_count = sum(1 for sc in scenes if sc.get("completed"))
+                col_prog1, col_prog2 = st.columns([3, 1], vertical_alignment="center")
+                with col_prog1:
+                    st.progress(completed_count / total_scenes)
+                with col_prog2:
+                    st.markdown(f"🏆 **Đã duyệt: {completed_count}/{total_scenes}**")
                 
-                label_emoji = "🪝" if i == 0 else ("🎯" if i == len(proj.get('scenes', [])) - 1 else "▶️")
-                
-                with st.expander(f"{label_emoji} Cảnh {i+1}: {scene.get('text', '')[:30]}... ⏱️{scene.get('duration',5)}s", expanded=(i==0)):
-                    if note:
-                        st.caption(f"💡 *Mục tiêu cảnh: {note}*")
+                # Active page or scene select
+                if "selectbox_scene_active" not in st.session_state:
+                    st.session_state.selectbox_scene_active = proj.get("active_scene_idx", 0)
+                if "selectbox_page_active" not in st.session_state:
+                    st.session_state.selectbox_page_active = proj.get("active_page", 0)
+                if "view_mode" not in st.session_state:
+                    st.session_state.view_mode = proj.get("view_mode", "Tập trung (Mượt nhất)")
 
-                    col_left, col_right = st.columns([2, 1])
+                def go_prev_scene(curr):
+                    st.session_state.selectbox_scene_active = curr - 1
+                    proj["active_scene_idx"] = curr - 1
+                    save_proj(proj)
+
+                def go_next_scene(curr):
+                    st.session_state.selectbox_scene_active = curr + 1
+                    proj["active_scene_idx"] = curr + 1
+                    save_proj(proj)
                     
-                    with col_left:
-                        new_text = st.text_area("Nội dung lời đọc (Voice):", value=scene.get('text', ''), key=f"text_{i}", height=120)
-                        new_kw = st.text_input("Từ khóa AI tìm video (Pexels):", value=scene.get('keyword', ''), key=f"kw_{i}")
+                view_mode = st.radio(
+                    "👁️ Chế độ xem kịch bản:",
+                    options=["Tập trung (Mượt nhất)", "Phân trang (10 cảnh/trang)", "Tất cả (Yêu cầu cấu hình mạnh)"],
+                    horizontal=True,
+                    index=["Tập trung (Mượt nhất)", "Phân trang (10 cảnh/trang)", "Tất cả (Yêu cầu cấu hình mạnh)"].index(st.session_state.view_mode),
+                    key="view_mode_select"
+                )
+                if view_mode != proj.get("view_mode"):
+                    proj["view_mode"] = view_mode
+                    st.session_state.view_mode = view_mode
+                    save_proj(proj)
+                
+                scenes_to_render = []
+                if view_mode == "Tập trung (Mượt nhất)":
+                    scene_options = [
+                        f"Cảnh {idx+1} {'(✅ Hoàn tất)' if sc.get('completed') else '(⏳ Đang chờ)'}: {sc.get('text', '')[:50]}..." 
+                        for idx, sc in enumerate(scenes)
+                    ]
+                    active_idx = st.selectbox(
+                        "🎯 Chọn cảnh đang chỉnh sửa:",
+                        options=range(total_scenes),
+                        format_func=lambda x: scene_options[x],
+                        index=min(st.session_state.selectbox_scene_active, total_scenes - 1),
+                        key="selectbox_scene_active"
+                    )
+                    if active_idx != proj.get("active_scene_idx"):
+                        proj["active_scene_idx"] = active_idx
+                        save_proj(proj)
+                    scenes_to_render.append((active_idx, scenes[active_idx]))
+                    
+                    # Jump buttons
+                    col_nav1, col_nav2, col_nav3 = st.columns([1, 2, 1])
+                    with col_nav1:
+                        st.button(
+                            "◀ Cảnh Trước", 
+                            disabled=(active_idx == 0), 
+                            key="btn_prev_scene",
+                            on_click=go_prev_scene,
+                            args=(active_idx,)
+                        )
+                    with col_nav3:
+                        st.button(
+                            "Cảnh Tiếp Theo ▶", 
+                            disabled=(active_idx == total_scenes - 1), 
+                            key="btn_next_scene",
+                            on_click=go_next_scene,
+                            args=(active_idx,)
+                        )
+                            
+                elif view_mode == "Phân trang (10 cảnh/trang)":
+                    items_per_page = 10
+                    total_pages = (total_scenes + items_per_page - 1) // items_per_page
+                    active_page = st.selectbox(
+                        "📄 Chọn trang:",
+                        options=range(total_pages),
+                        format_func=lambda x: f"Trang {x+1} (Cảnh {x*items_per_page+1} - {min((x+1)*items_per_page, total_scenes)})",
+                        index=min(st.session_state.selectbox_page_active, total_pages - 1),
+                        key="selectbox_page_active"
+                    )
+                    if active_page != proj.get("active_page"):
+                        proj["active_page"] = active_page
+                        save_proj(proj)
+                    
+                    start_idx = active_page * items_per_page
+                    end_idx = min(start_idx + items_per_page, total_scenes)
+                    for idx in range(start_idx, end_idx):
+                        scenes_to_render.append((idx, scenes[idx]))
+                else:
+                    for idx in range(total_scenes):
+                        scenes_to_render.append((idx, scenes[idx]))
                         
-                        up_vid = st.file_uploader("Upload Video của bạn (mp4) — ghi đè Pexels:", type=["mp4","mov"], key=f"up_{i}")
-                        
-                        st.markdown("**🔍 Tìm & Đổi video Pexels khác:**")
-                        if st.button("🔎 Tải danh sách video Pexels", key=f"search_btn_{i}"):
-                            st.session_state[f"search_results_{i}"] = search_pexels_videos(
-                                new_kw, 
-                                orientation="portrait" if "9:16" in aspect else "landscape"
-                            )
-                        
-                        results = st.session_state.get(f"search_results_{i}", [])
-                        if results:
-                            cols = st.columns(3)
-                            for idx, res in enumerate(results[:6]): # Limit to 6 results for better UI
-                                with cols[idx % 3]:
-                                    st.image(res["image"], use_container_width=True)
-                                    st.caption(f"⏱️ {res['duration']}s")
-                                    if st.button("Chọn", key=f"sel_res_{i}_{idx}"):
-                                        proj["scenes"][i]["videoUrl"] = res["url"]
-                                        proj["scenes"][i]["customVid"] = None
-                                        proj["scenes"][i]["duration"] = res["duration"]
-                                        edited = True
-                                        st.rerun()
-
-                    with col_right:
-                        new_dur = st.number_input("⏱️ Thời lượng (giây):", min_value=1.0, max_value=300.0,
-                                                   value=float(scene.get("duration") or 5.0),
-                                                   step=0.1, key=f"rv_dur_{i}")
-                                                   
-                        st.markdown("**🎬 Video hiện tại**")
-                        if proj["scenes"][i].get("customVid") and Path(proj["scenes"][i]["customVid"]).exists():
-                            st.success(f"🎥 Dùng video tải lên")
-                            if st.button("Xóa video tải lên", key=f"del_{i}"):
-                                proj["scenes"][i]["customVid"] = None
-                                edited = True
-                                st.rerun()
-                        elif scene.get("videoUrl"):
-                            st.success(f"🔗 Đã liên kết Pexels")
-                            st.video(scene.get("videoUrl"))
-                            if st.button("Xóa liên kết video", key=f"del_url_{i}"):
-                                proj["scenes"][i]["videoUrl"] = None
-                                edited = True
-                                st.rerun()
-                        else:
-                            st.warning("⚠️ Chưa có video")
-
-                    if new_text != scene.get('text') or new_kw != scene.get('keyword') or new_dur != scene.get('duration'):
-                        proj["scenes"][i]["text"] = new_text
-                        proj["scenes"][i]["keyword"] = new_kw
-                        proj["scenes"][i]["duration"] = new_dur
-                        edited = True
-                        
-                    if up_vid:
-                        custom_path = AUDIO_DIR / f"custom_{i}_{up_vid.name}"
-                        # Chỉ ghi file nếu chưa tồn tại hoặc khác dung lượng
-                        if not custom_path.exists() or custom_path.stat().st_size != up_vid.size:
-                            custom_path.write_bytes(up_vid.read())
-                        
-                        # Probe thời lượng video tải lên
-                        dur_seconds = 10
-                        try:
-                            probe = subprocess.run(
-                                [FFMPEG, "-i", str(custom_path), "-f", "null", "-"],
-                                capture_output=True, text=True
-                            )
-                            for line in probe.stderr.split("\n"):
-                                if "Duration:" in line:
-                                    ts = line.split("Duration:")[1].split(",")[0].strip()
-                                    h, m, s = ts.split(":")
-                                    dur_seconds = int(h)*3600 + int(m)*60 + float(s)
-                                    break
-                        except Exception as pe:
-                            print(f"[Probe] Lỗi: {pe}")
-
-                        if proj["scenes"][i].get("customVid") != str(custom_path):
-                            proj["scenes"][i]["customVid"] = str(custom_path)
-                            # Tự động gán thời lượng bằng video tải lên
-                            proj["scenes"][i]["duration"] = round(dur_seconds)
+                for idx, scene in scenes_to_render:
+                    scene_data = s.get("scenes", [])
+                    note = ""
+                    if idx < len(scene_data) and isinstance(scene_data[idx], dict):
+                        note = scene_data[idx].get("retention_note", "")
+                    
+                    label_emoji = "✅" if scene.get("completed") else ("🪝" if idx == 0 else ("🎯" if idx == total_scenes - 1 else "▶️"))
+                    is_expanded = True if view_mode == "Tập trung (Mượt nhất)" else (idx == scenes_to_render[0][0])
+                    
+                    with st.expander(f"{label_emoji} Cảnh {idx+1}: {scene.get('text', '')[:40]}... ⏱️{scene.get('duration',5)}s", expanded=is_expanded):
+                        if note:
+                            st.caption(f"💡 *Mục tiêu cảnh: {note}*")
+                            
+                        col_left, col_right = st.columns([2, 1])
+                        with col_left:
+                            new_text = st.text_area("Nội dung lời đọc (Voice):", value=scene.get('text', ''), key=f"text_{idx}", height=120)
+                            new_kw = st.text_input("Từ khóa AI tìm video (Stock):", value=scene.get('keyword', ''), key=f"kw_{idx}")
+                            
+                            up_vid = st.file_uploader("Upload Video của bạn (mp4) — ghi đè Stock:", type=["mp4","mov"], key=f"up_{idx}")
+                            
+                            st.markdown("**🔍 Tìm & Đổi video khác:**")
+                            if st.button("🔎 Tải danh sách video", key=f"search_btn_{idx}"):
+                                st.session_state[f"search_results_{idx}"] = search_stock_videos(
+                                    new_kw, 
+                                    orientation="portrait" if "9:16" in aspect else "landscape"
+                                )
+                            
+                            results = st.session_state.get(f"search_results_{idx}", [])
+                            if results:
+                                cols = st.columns(3)
+                                for res_idx, res in enumerate(results[:6]):
+                                    with cols[res_idx % 3]:
+                                        st.image(res["image"], use_container_width=True)
+                                        st.caption(f"⏱️ {res['duration']}s")
+                                        if st.button("Chọn", key=f"sel_res_{idx}_{res_idx}"):
+                                            proj["scenes"][idx]["videoUrl"] = res["url"]
+                                            proj["scenes"][idx]["customVid"] = None
+                                            proj["scenes"][idx]["duration"] = res["duration"]
+                                            if "used_videos" not in cfg:
+                                                cfg["used_videos"] = []
+                                            if res["url"] not in cfg["used_videos"]:
+                                                cfg["used_videos"].append(res["url"])
+                                                if len(cfg["used_videos"]) > 1000:
+                                                    cfg["used_videos"].pop(0)
+                                                save_cfg(cfg)
+                                            edited = True
+                                            st.rerun()
+                                            
+                        with col_right:
+                            new_dur = st.number_input("⏱️ Thời lượng (giây):", min_value=1.0, max_value=300.0,
+                                                       value=float(scene.get("duration") or 5.0),
+                                                       step=0.1, key=f"rv_dur_{idx}")
+                            
+                            st.markdown("**🎬 Video hiện tại**")
+                            has_any_video = False
+                            if proj["scenes"][idx].get("customVid") and Path(proj["scenes"][idx]["customVid"]).exists():
+                                st.success(f"🎥 Dùng video tải lên")
+                                if st.button("Xóa video tải lên", key=f"del_{idx}"):
+                                    proj["scenes"][idx]["customVid"] = None
+                                    edited = True
+                                    st.rerun()
+                                has_any_video = True
+                            elif scene.get("videoUrl"):
+                                st.success(f"🔗 Đã liên kết Pexels")
+                                st.video(scene.get("videoUrl"))
+                                if st.button("Xóa liên kết video", key=f"del_url_{idx}"):
+                                    proj["scenes"][idx]["videoUrl"] = None
+                                    edited = True
+                                    st.rerun()
+                                has_any_video = True
+                            else:
+                                st.warning("⚠️ Chưa có video")
+                                
+                            new_mode = "start"
+                            new_start = 0.0
+                            if has_any_video:
+                                st.markdown("---")
+                                trim_options = {
+                                    "start": "Đầu video (0s)",
+                                    "middle": "Giữa video",
+                                    "end": "Cuối video",
+                                    "random": "Ngẫu nhiên",
+                                    "custom": "Tự chọn giây bắt đầu"
+                                }
+                                curr_mode = scene.get("videoTrimMode", "start")
+                                mode_keys = list(trim_options.keys())
+                                default_idx = mode_keys.index(curr_mode) if curr_mode in mode_keys else 0
+                                new_mode = st.selectbox(
+                                    "✂️ Đoạn hiển thị video:",
+                                    options=mode_keys,
+                                    format_func=lambda x: trim_options[x],
+                                    index=default_idx,
+                                    key=f"trim_mode_{idx}"
+                                )
+                                if new_mode == "custom":
+                                    curr_start = float(scene.get("videoTrimStart", 0.0))
+                                    new_start = st.number_input(
+                                        "⏱️ Giây bắt đầu cắt:",
+                                        min_value=0.0,
+                                        max_value=300.0,
+                                        value=curr_start,
+                                        step=0.5,
+                                        key=f"trim_start_{idx}"
+                                    )
+                                    
+                            st.markdown("---")
+                            completed = st.checkbox("✅ Đã duyệt xong cảnh này", value=bool(scene.get("completed", False)), key=f"comp_{idx}")
+                            
+                            # Next and save button
+                            if view_mode == "Tập trung (Mượt nhất)":
+                                st.button(
+                                    "💾 Lưu & Sang cảnh tiếp ▶", 
+                                    key=f"next_btn_{idx}", 
+                                    use_container_width=True,
+                                    on_click=save_and_next_scene,
+                                    args=(
+                                        idx,
+                                        new_text,
+                                        new_kw,
+                                        new_dur,
+                                        new_mode,
+                                        new_start if new_mode == "custom" else 0.0
+                                    )
+                                )
+                                    
+                        if (new_text != scene.get('text') or 
+                            new_kw != scene.get('keyword') or 
+                            new_dur != scene.get('duration') or 
+                            new_mode != scene.get('videoTrimMode', 'start') or
+                            (new_mode == 'custom' and new_start != scene.get('videoTrimStart', 0.0)) or
+                            completed != scene.get('completed', False)):
+                            
+                            proj["scenes"][idx]["text"] = new_text
+                            proj["scenes"][idx]["keyword"] = new_kw
+                            proj["scenes"][idx]["duration"] = new_dur
+                            proj["scenes"][idx]["videoTrimMode"] = new_mode
+                            if new_mode == "custom":
+                                proj["scenes"][idx]["videoTrimStart"] = new_start
+                            proj["scenes"][idx]["completed"] = completed
                             edited = True
-                            st.rerun()
-
+                            
+                        if up_vid:
+                            custom_path = AUDIO_DIR / f"custom_{idx}_{up_vid.name}"
+                            if not custom_path.exists() or custom_path.stat().st_size != up_vid.size:
+                                custom_path.write_bytes(up_vid.read())
+                                
+                            dur_seconds = 10
+                            try:
+                                probe = subprocess.run(
+                                    [FFMPEG, "-i", str(custom_path), "-f", "null", "-"],
+                                    capture_output=True, text=True
+                                )
+                                for line in probe.stderr.split("\n"):
+                                    if "Duration:" in line:
+                                        ts = line.split("Duration:")[1].split(",")[0].strip()
+                                        h, m, s = ts.split(":")
+                                        dur_seconds = int(h)*3600 + int(m)*60 + float(s)
+                                        break
+                            except Exception as pe:
+                                print(f"[Probe] Lỗi: {pe}")
+                                
+                            if proj["scenes"][idx].get("customVid") != str(custom_path):
+                                proj["scenes"][idx]["customVid"] = str(custom_path)
+                                proj["scenes"][idx]["duration"] = round(dur_seconds)
+                                edited = True
+                                st.rerun()
+                                
             if edited:
                 save_proj(proj)
                 st.success("Đã lưu các thay đổi của bạn!")

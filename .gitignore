@@ -4,6 +4,8 @@ __pycache__/
 *.so
 .Python
 env/
+venv/
+.venv/
 build/
 develop-eggs/
 dist/
@@ -28,6 +30,8 @@ htmlcov/
 .idea/
 .vscode/
 .DS_Store
+
+# Media files (large, generated)
 *.mp4
 *.mp3
 *.wav
@@ -35,6 +39,16 @@ htmlcov/
 *.jpg
 *.jpeg
 *.png
+*.srt
+*.ass
+
+# Runtime & generated dirs
 grok_downloads/
 grok_profiles/
 baseTEMP_*
+src_veo_grok/
+
+# Runtime config (contains API keys — NEVER commit)
+.avc_config.json
+.avc_project.json
+.avc_project_shorts.json
