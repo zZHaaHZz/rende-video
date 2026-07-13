@@ -29,6 +29,9 @@ _CC_DIR = _HERE / "capcut-tts-api"
 if str(_CC_DIR) not in sys.path:
     sys.path.insert(0, str(_CC_DIR))
 
+_CC_AVAILABLE = False
+_CC_IMPORT_ERR = ""
+
 try:
     from capcut_common_task_client import (
         DEFAULT_DEVICE,
@@ -43,7 +46,6 @@ try:
     )
     _CC_AVAILABLE = True
 except ImportError as _e:
-    _CC_AVAILABLE = False
     _CC_IMPORT_ERR = str(_e)
 
 
@@ -100,7 +102,7 @@ CAPCUT_VOICE_DEFAULTS = {
 }
 
 POLL_INTERVAL  = 2.0   # seconds between polls
-POLL_MAX_TRIES = 60    # max ~2 minutes
+POLL_MAX_TRIES = 15    # max ~30s (trước là 60x3s=180s bị stuck quá lâu)
 
 
 def is_available() -> bool:
@@ -241,20 +243,15 @@ def tts_capcut(
     voice_type, resource_id = CAPCUT_VOICES.get(voice_key, ("BV074_streaming", "7102355709945188865"))
 
     try:
-        # Tự động sinh device ID mới cho mỗi request để tránh lỗi ExceededConcurrentLimit
-        import random
-        from capcut_common_task_client import DEFAULT_DEVICE
-        new_did = str(random.randint(7_000_000_000_000_000_000, 7_999_999_999_999_999_999))
-        DEFAULT_DEVICE["device_id"] = new_did
-        DEFAULT_DEVICE["iid"] = new_did
-        DEFAULT_DEVICE["tdid"] = new_did
-        
+        # _build_tts_request đã dùng _fresh_device() → deepcopy + randomize device IDs
+        # KHÔNG mutate DEFAULT_DEVICE trực tiếp vì sẽ gây lỗi concurrent requests
+
         # 1. Submit
         task_id, token = submit_tts_task(text, voice_type, resource_id, rate)
         print(f"[CapCut TTS] Task submitted: {task_id}")
 
         # 2. Poll
-        audio_url = poll_tts_task(task_id, token, timeout=120.0)
+        audio_url = poll_tts_task(task_id, token, timeout=30.0)  # 30s timeout — nếu không về là lỗi
         print(f"[CapCut TTS] Audio ready: {audio_url[:80]}...")
 
         # 3. Download
