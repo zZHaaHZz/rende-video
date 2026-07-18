@@ -96,7 +96,7 @@ def call_gemini(key, prompt):
     try:
         r = requests.post(
             f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={key}",
-            json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.85, "maxOutputTokens": 8192, "responseMimeType": "application/json"}},
+            json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.65, "maxOutputTokens": 8192, "responseMimeType": "application/json"}},
             timeout=60,
         )
         d = r.json()
@@ -110,7 +110,7 @@ def call_gemini(key, prompt):
     # Fallback
     r = requests.post(
         f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={key}",
-        json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.85, "maxOutputTokens": 8192, "responseMimeType": "application/json"}},
+        json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.65, "maxOutputTokens": 8192, "responseMimeType": "application/json"}},
         timeout=60,
     )
     d = r.json()
@@ -147,7 +147,7 @@ def call_groq_llm(key, prompt):
                     json={
                         "model": model,
                         "messages": [{"role": "user", "content": prompt}],
-                        "temperature": 0.85,
+                        "temperature": 0.65,
                         "max_tokens": 8192,
                     },
                     timeout=90,
@@ -198,7 +198,7 @@ def call_openai(key, prompt, model="gpt-4o-mini"):
             json={
                 "model": model,
                 "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.85,
+                "temperature": 0.65,
                 "max_tokens": 8192,
             },
             timeout=120,
@@ -2636,10 +2636,7 @@ with tab_main:
         # Quét thư mục project để gợi ý file nhạc có sẵn
         _bgm_local_opts = ["(Không dùng)"]
         _bgm_scan_dirs  = [
-            Path.cwd(),
-            Path.home() / "Downloads",
-            Path.home() / "Music",
-            Path.home() / "Desktop",
+            Path.home() / "Documents" / "99999" / "music",
         ]
         _bgm_found = {}
         for _d in _bgm_scan_dirs:
@@ -2667,12 +2664,279 @@ with tab_main:
 
         # ── Action buttons cuối cấu hình ────────────────────────────────────
         st.divider()
-        use_ai_images = st.checkbox("🎨 Dùng Ảnh tĩnh AI (100% Unique - Khuyên dùng)", value=True, help="Tự động tạo ảnh bằng AI (Gemini) thay vì dùng video stock, giúp video không bao giờ bị đánh gậy Reused Content của YouTube. Video xuất ra vẫn có hiệu ứng chuyển động.")
-        
-        gen_script = st.button("📝 Tạo Kịch Bản", type="primary", width="stretch") if not proj.get("script") else None
-        run_all    = st.button("🚀 Tạo Video (Footage + TTS + Render)", type="primary", width="stretch") if proj.get("script") else None
-        run_render = st.button("🎥 Chỉ Render Video", width="stretch") if proj.get("scenes") else None
-        reset_btn  = st.button("🗑️ Xóa & làm lại", width="stretch") if proj.get("script") else None
+        # Checkbox được render ở đây khi chưa có kịch bản.
+        # Khi đã có kịch bản, nó được render ngư trước nút Tạo Video (bên dưới) để gần ngắn hơn.
+        if not proj.get("script"):
+            use_ai_images = st.checkbox(
+                "🎨 Dùng Ảnh tĩnh AI (100% Unique - Khuyên dùng)",
+                value=True,
+                key="use_ai_images_main",
+                help="Tự động tạo ảnh bằng AI (Gemini) thay vì dùng video stock, giúp video không bao giờ bị đánh gậy Reused Content của YouTube."
+            )
+        else:
+            # Chưa render checkbox ở đây, sẽ render ngắn ngay trước nút Tạo Video
+            use_ai_images = st.session_state.get("use_ai_images_main", True)
+
+        # ── Helper: build export prompt từ cấu hình hiện tại ────────────────
+        def _build_export_prompt():
+            _ep_topic  = custom.strip() or niche
+            _ep_sc     = max(2, round(duration / target_sec_per_scene))
+            _wps_map   = {"Vietnamese": 3.8, "Korean": 2.2, "English": 2.2}
+            _min_map   = {"Vietnamese": 35,  "Korean": 18,  "English": 18}
+            _wps       = _wps_map.get(lang, 2.2)
+            _wpsc      = max(_min_map.get(lang, 18), round(target_sec_per_scene * _wps))
+            _kw_ex     = {
+                "Korean":     '"young Korean man stressed apartment"',
+                "Vietnamese": '"Vietnamese street scene urban"',
+            }.get(lang, '"person stressed desk office"')
+            _lang_rule = {
+                "Korean":     "Write 100% in natural Korean (해요체, Hangul only, NO Hanja, NO Chinese characters).",
+                "Vietnamese": "Write 100% in natural Vietnamese with full diacritics (có dấu đầy đủ).",
+                "English":    "Write in clear, punchy, natural English.",
+            }.get(lang, "Write in the selected language.")
+            return (
+                f"[AI VIDEO SCRIPT — {lang.upper()}]\n"
+                f"You are an elite short-form video scriptwriter. Generate a viral {style} script.\n\n"
+                f"=== VIDEO SPECS ===\n"
+                f"Topic: {_ep_topic}\n"
+                f"Language: {lang} — {_lang_rule}\n"
+                f"Total duration: {duration}s | Scenes: {_ep_sc} | Words/scene: ~{_wpsc}\n"
+                f"Hook style: {hook_style}\n\n"
+                f"=== LANGUAGE & GRAMMAR PURITY (HARD RULES — VIOLATIONS = REJECTED) ===\n"
+                f"1. 100% native {lang}. ZERO mixing other languages (exception: OECD, GDP, FED etc.).\n"
+                f"2. NO HALLUCINATION: Use only real, correctly-spelled words. NEVER invent nonexistent words.\n"
+                f"   Korean example: use '치솟고' NOT '취속고'. Vietnamese: use 'tăng vọt' NOT 'tăng vọt vọt'.\n"
+                f"3. NO STUTTERING: NEVER repeat a word consecutively.\n"
+                f"   FORBIDDEN: '이를 이를', '그래서 그래서', 'của của', 'và và', 'the the'.\n"
+                f"4. TONE: Aggressive, street-smart TikTok financial analyst. Punchy, NOT academic/robotic.\n\n"
+                f"=== HOOK (SCENE 1) ===\n"
+                f"Style: {hook_style}\n"
+                f"MUST trigger immediate emotion (shock/fear/curiosity) in max 1.5 seconds.\n"
+                f"FORBIDDEN openers: 'Many people wonder...', '오늘은 ~에 대해', 'Hôm nay mình sẽ chia sẻ'.\n\n"
+                f"=== FINAL SCENE CTA ===\n"
+                f"MUST end with a provocative question forcing comments.\n"
+                f"FORBIDDEN: 'Follow for more', '팔로우해주세요', 'Follow để biết thêm'.\n\n"
+                f"=== ANTI-REPETITION ===\n"
+                f"Each scene = 1 completely NEW idea. NEVER reuse the same concept across scenes.\n\n"
+                f"=== RETURN FORMAT (ONLY valid JSON — no markdown, no explanation) ===\n"
+                f'{{\n'
+                f'  "title": "viral title in {lang} (max 60 chars)",\n'
+                f'  "description": "SEO description in {lang} (150-200 words)",\n'
+                f'  "tags": ["tag1", "tag2", "tag3", "tag4", "tag5"],\n'
+                f'  "scenes": [\n'
+                f'    {{\n'
+                f'      "id": 1,\n'
+                f'      "text": "narration in {lang} — exactly {_wpsc} words",\n'
+                f'      "keyword": {_kw_ex},\n'
+                f'      "veo3_prompt": "[Tiếng Việt] Mô tả cảnh quay: chủ thể, hành động, bối cảnh, góc máy, ánh sáng",\n'
+                f'      "retention_note": "why viewer stays"\n'
+                f'    }}\n'
+                f'  ]\n'
+                f'}}\n\n'
+                f"Write EXACTLY {_ep_sc} scenes (id 1 to {_ep_sc}). Each narration ~{_wpsc} words. Return ONLY the JSON."
+            )
+
+        # ── 2 nút chính: Tự động | Thủ công ────────────────────────────────
+        if not proj.get("script"):
+            _btn_col1, _btn_col2 = st.columns(2)
+            with _btn_col1:
+                gen_script = st.button(
+                    "📝 Tạo Kịch Bản\n(Tự động · AI viết luôn)",
+                    type="primary", use_container_width=True,
+                    help="AI tự tạo kịch bản và chạy toàn bộ pipeline"
+                )
+            with _btn_col2:
+                _export_clicked = st.button(
+                    "📤 Xuất Prompt\n(Thủ công · Copy vào ChatGPT)",
+                    use_container_width=True,
+                    help="Tạo prompt chuẩn để bạn tự copy vào ChatGPT/Claude rồi paste JSON trở lại"
+                )
+            if _export_clicked:
+                st.session_state["_gpt_export_prompt"] = _build_export_prompt()
+        else:
+            gen_script     = None
+            _export_clicked = False
+
+        # ── Hiển thị prompt vừa xuất (nếu có) ──────────────────────────────
+        if st.session_state.get("_gpt_export_prompt") and not proj.get("script"):
+            st.markdown("---")
+            st.markdown("**📋 Prompt — Ctrl+A → Ctrl+C để copy, rồi paste vào ChatGPT / Claude / Gemini:**")
+            st.text_area(
+                label="Prompt content",
+                label_visibility="collapsed",
+                value=st.session_state["_gpt_export_prompt"],
+                height=300,
+                key="export_prompt_display",
+            )
+            st.info("💡 Copy JSON kết quả → mở **▼ Nhập JSON từ ChatGPT** bên dưới để tiếp tục.")
+            if st.button("🗑️ Xóa prompt", key="btn_clear_prompt"):
+                del st.session_state["_gpt_export_prompt"]
+                st.rerun()
+
+        # ── Import JSON (expander gọn) ───────────────────────────────────────
+        with st.expander("📥 Nhập JSON từ ChatGPT → tiếp tục STEP 2", expanded=False):
+            _import_raw = st.text_area(
+                "Paste JSON kịch bản vào đây:",
+                placeholder='{"title": "...", "scenes": [{"id": 1, "text": "...", "keyword": "...", "veo3_prompt": "..."}]}',
+                height=180,
+                key="import_json_input",
+            )
+            if st.button("✅ Nhập JSON → Bắt đầu STEP 2", key="btn_import_json", type="primary"):
+                if not _import_raw.strip():
+                    st.error("⚠️ Ô JSON trống — hãy paste kết quả từ ChatGPT vào.")
+                else:
+                    try:
+                        _imp = parse_json_robust(_import_raw)
+                        _imp_scenes = _imp.get("scenes", [])
+                        if not _imp_scenes:
+                            st.error("❌ JSON thiếu trường 'scenes' — kiểm tra lại output của ChatGPT.")
+                        else:
+                            for _s in _imp_scenes:
+                                _rt = _s.get("text", "")
+                                _ct = re.sub(r'\b(\w+)( \1\b)+', r'\1', _rt)
+                                _s["text"] = " ".join(_ct.split())
+                                if not _s.get("keyword"):
+                                    _s["keyword"] = niche
+                                if not _s.get("veo3_prompt"):
+                                    _s["veo3_prompt"] = f"Cảnh về {niche}, cinematic, 4K"
+                            _imp_script = {
+                                "title":       _imp.get("title", custom.strip() or niche),
+                                "description": _imp.get("description", ""),
+                                "tags":        _imp.get("tags", []),
+                                "scenes":      _imp_scenes,
+                            }
+                            # ── Pre-populate proj["scenes"] để edit UI hoạt động ngay ──
+                            _wps_map_imp = {"Vietnamese": 3.8, "Korean": 2.2, "English": 2.2}
+                            _wps_imp = _wps_map_imp.get(lang, 2.2) * float(tts_rate)
+                            _tgt_imp = float(target_sec_per_scene)
+                            _imp_built_scenes = []
+                            for _ii, _sc in enumerate(_imp_scenes):
+                                _txt = _sc.get("text", "")
+                                _dur = round(max(_tgt_imp, len(_txt.split()) / max(_wps_imp, 0.1) + 0.4), 1)
+                                _imp_built_scenes.append({
+                                    "id":          _sc.get("id", _ii + 1),
+                                    "text":        _txt,
+                                    "keyword":     _sc.get("keyword", niche),
+                                    "veo3_prompt": _sc.get("veo3_prompt", f"Cảnh về {niche}, cinematic, 4K"),
+                                    "retention_note": _sc.get("retention_note", ""),
+                                    "videoUrl":    None,
+                                    "veo3Path":    None,
+                                    "imageUrl":    None,
+                                    "customVid":   None,
+                                    "audioDone":   False,
+                                    "targetDur":   _tgt_imp,
+                                    "duration":    _dur,
+                                })
+                            st.session_state.proj["script"] = _imp_script
+                            st.session_state.proj["step"]   = 1
+                            st.session_state.proj["scenes"] = _imp_built_scenes
+                            st.session_state.proj["lang"]   = lang
+                            st.session_state.proj["target_sec_per_scene"] = _tgt_imp
+                            save_proj(st.session_state.proj)
+                            if "_gpt_export_prompt" in st.session_state:
+                                del st.session_state["_gpt_export_prompt"]
+                            st.success(f"✅ Đã nhập {len(_imp_scenes)} cảnh! Duyệt kịch bản bên dưới, chọn video nền (tùy chọn) → nhấn **🚀 Tạo Video** khi sẵn sàng.")
+                            st.rerun()
+                    except Exception as _ie:
+                        st.error(f"❌ Lỗi parse JSON: {_ie}\n\nĐảm bảo output ChatGPT là JSON thuần — không có ```json``` bao quanh.")
+        if proj.get("script"):
+            # Hiển thị tùy chọn footage ngay trước nút Tạo Video
+            # Giúp user thấy được dù luồng Import JSON hay luồng Tạo kịch bản
+            _scenes_run = any(s.get("audioFile") for s in proj.get("scenes", []))
+            if not _scenes_run:
+                st.markdown("**🎬 Chọn nguồn footage:**")
+                use_ai_images = st.checkbox(
+                    "🎨 Dùng Ảnh tĩnh AI (100% Unique, tránh bị gậy Reused Content)",
+                    value=st.session_state.get("use_ai_images_main", True),
+                    key="use_ai_images_confirm",
+                    help="Bật → AI tạo ảnh unique (Gemini Imagen). Tắt → tool tự tìm video stock Pexels/Pixabay."
+                )
+        run_all    = st.button("🚀 Tạo Video (Footage + TTS + Render)", type="primary", use_container_width=True) if proj.get("script") else None
+        run_render = st.button("🎥 Chỉ Render Video", use_container_width=True) if proj.get("scenes") else None
+        reset_btn  = st.button("🗑️ Xóa & làm lại", use_container_width=True) if proj.get("script") else None
+
+        # ── Preview kịch bản + chọn video nền thủ công ───────────────────
+        _scr = proj.get("script")
+        _sc_list = (_scr.get("scenes") or []) if _scr else []
+        if _sc_list and proj.get("step", 0) < 4:
+            # Auto-mở preview khi vừa tạo kịch bản / vừa nhập JSON (step=1, pipeline chưa chạy)
+            _scenes_have_audio = any(s.get("audioFile") for s in proj.get("scenes", []))
+            _preview_auto_open = (proj.get("step", 0) == 1 and not _scenes_have_audio)
+            with st.expander(f"🎬 Preview kịch bản ({len(_sc_list)} cảnh) — tùy chọn thay video nền", expanded=_preview_auto_open):
+                _AUTO_MIX = 3  # giống AUTO_MIX_PHOTO_EVERY trong pipeline
+                # Xác định loại footage dự kiến theo cùng logic pipeline
+                _use_ai = st.session_state.get("use_ai_images_confirm",
+                          st.session_state.get("use_ai_images_main", True))
+                if _use_ai:
+                    _badge_legend = "🤖 AI Image · 🎬 Video stock (cứ 3 cảnh AI → xen 1 ảnh stock)"
+                else:
+                    _badge_legend = "🎬 Video stock · 🖼️ Ảnh stock (cứ 3 cảnh video → xen 1 ảnh)"
+                st.caption(f"💡 Để trống → tool tự tìm footage tự động ({_badge_legend}). Upload file → ưu tiên dùng video của bạn.")
+                _custom_changed = False
+                _vis_counter = 0  # đếm cảnh chưa có custom để tính xen kẽ
+                for _si, _sc_item in enumerate(_sc_list):
+                    _c1, _c2 = st.columns([3, 2])
+                    # Lấy trạng thái thực từ proj["scenes"] nếu có
+                    _proj_scenes = proj.get("scenes", [])
+                    _proj_sc = _proj_scenes[_si] if _si < len(_proj_scenes) else {}
+                    _has_custom = _proj_sc.get("customVid") or _proj_sc.get("videoUrl") or _proj_sc.get("imageUrl")
+                    # Tính badge dự kiến (chỉ khi chưa có footage)
+                    if not _has_custom:
+                        _is_planned_photo = (_si > 0) and (_vis_counter % _AUTO_MIX == _AUTO_MIX - 1) and not _use_ai
+                        _is_planned_ai    = _use_ai and not (_si > 0 and _vis_counter % _AUTO_MIX == _AUTO_MIX - 1)
+                        if _is_planned_photo:
+                            _footage_badge = "🖼️ *Ảnh stock (Ken Burns)*"
+                        elif _use_ai:
+                            _footage_badge = "🤖 *AI Image (Gemini)*"
+                        else:
+                            _footage_badge = "🎬 *Video stock (Pexels)*"
+                        _vis_counter += 1
+                    else:
+                        _footage_badge = f"✅ *{'Custom' if _proj_sc.get('customVid') else ('Ảnh' if _proj_sc.get('imageUrl') else 'Video')}*"
+                    with _c1:
+                        _txt = _sc_item.get("text", "")
+                        st.markdown(f"**Cảnh {_si+1}:** {_txt[:120]}{'...' if len(_txt) > 120 else ''}")
+                        st.caption(f"🔍 Keyword: `{_sc_item.get('keyword', '')}` | {_footage_badge}")
+                    with _c2:
+                        _uploaded = st.file_uploader(
+                            f"Video nền cảnh {_si+1}",
+                            type=["mp4", "mov", "avi", "webm"],
+                            key=f"custom_vid_{_si}",
+                            label_visibility="collapsed",
+                        )
+                        if _uploaded is not None:
+                            _save_dir = Path("/tmp/ai_video_custom")
+                            _save_dir.mkdir(exist_ok=True)
+                            _save_path = _save_dir / f"custom_scene_{_si}_{_uploaded.name}"
+                            _save_path.write_bytes(_uploaded.read())
+                            # Ghi vào proj["scenes"] để STEP 2 nhận customVid
+                            if not proj.get("scenes"):
+                                proj["scenes"] = [{} for _ in _sc_list]
+                            while len(proj["scenes"]) <= _si:
+                                proj["scenes"].append({})
+                            proj["scenes"][_si].update({
+                                "customVid":   str(_save_path),
+                                "id":          _sc_item.get("id", _si + 1),
+                                "text":        _sc_item.get("text", ""),
+                                "keyword":     _sc_item.get("keyword", niche),
+                                "veo3_prompt": _sc_item.get("veo3_prompt", ""),
+                                "videoUrl":    None,
+                                "veo3Path":    None,
+                                "imageUrl":    None,
+                                "audioDone":   False,
+                                "targetDur":   float(target_sec_per_scene),
+                                "duration":    float(target_sec_per_scene),
+                            })
+                            _custom_changed = True
+                            st.success(f"✅ Cảnh {_si+1}: `{_uploaded.name}`")
+                        else:
+                            _prev_scenes = proj.get("scenes") or []
+                            _prev_cv = _prev_scenes[_si].get("customVid") if _si < len(_prev_scenes) else None
+                            if _prev_cv:
+                                st.info(f"♻️ Đang dùng: `{Path(_prev_cv).name}`")
+                    st.divider()
+                if _custom_changed:
+                    save_proj(proj)
 
         # ── Trạng thái pipeline (inline) ────────────────
         steps_done = proj.get("step", 0)
@@ -2695,6 +2959,7 @@ with tab_main:
 
             if proj.get("output"):
                 st.success(f"🎥 Output: `{proj['output']}`")
+
 
         # ── Upload Strategy (expander gọn) ─────────
         with st.expander("📡 Chiến lược Upload & Checklist", expanded=False):
@@ -2799,6 +3064,9 @@ with tab_main:
             st.rerun()
 
         # ── Full pipeline ──────────────────────────────────────────────────
+        _auto_trigger = st.session_state.pop("_auto_run_all", False)  # clear ngay sau khi đọc
+        if _auto_trigger:
+            run_all = True  # force trigger pipeline sau khi import JSON
         if gen_script or run_all or run_render:
 
             topic = custom.strip() or niche
@@ -2881,11 +3149,14 @@ with tab_main:
 
                     hook_map = {
                         "🤯 Shock & Awe — Con số / sự thật gây sốc": (
-                            "SCENE 1 = SHOCK FIRST. Lead with the MOST ALARMING fact or number in the ENTIRE video. "
-                            "Do NOT warm up, do NOT define terms, do NOT ask 'Do you know what X is?'. "
-                            "Pattern: '[Shocking number/fact]! [One-line personal implication].' "
-                            "Example: '집주인이 지금 당신의 수억 원을 위험한 투자에 쓰고 있습니다.' "
-                            "Viewer MUST feel: 'Wait, WHAT?!' in the first 2 seconds."
+                            "SCENE 1 = SHOCK FIRST — formula options (pick ONE that fits topic):\n"
+                            "  Formula A — OUTRAGE NUMBER: '[Specific price/amount] 이게 말이 돼요?' → Viewer feels: 'That's insane!'\n"
+                            "  Formula B — RHETORICAL SARCASM: '[Question that mocks the system/status quo]잖아요.' → Viewer feels: 'Wait, they're right...'\n"
+                            "  Formula C — STRONG WARNING WORD: Start with '절망', '사기', '증발', '후회' or equivalent. → Viewer feels: 'Am I at risk?'\n"
+                            "ABSOLUTELY FORBIDDEN: 'Nhiều người tò mò...', '많은 분들이 궁금해하시는...', 'Bạn có biết...', '혹시 X에 대해 아시나요?'\n"
+                            "REQUIRED: The first 1.5 seconds MUST trigger one emotion: rage, shock, or fear of loss.\n"
+                            "Example KO: '서울 아파트 전세금이 5년 만에 두 배가 됐잖아요. 근데 월급은요?'\n"
+                            "Example VN: 'Giá thuê nhà tăng 80% trong 3 năm. Lương bạn tăng bao nhiêu?'"
                         ),
                         "❓ Curiosity Gap — Câu hỏi bỏ lửng tạo tò mò": (
                             "SCENE 1 = OPEN AN UNANSWERABLE LOOP. Ask a question so specific and unexpected that viewers MUST stay. "
@@ -2936,7 +3207,11 @@ with tab_main:
                         _hook_base +
                         " ANTI-DEFINITION GUARD: Scene 1 MUST NOT open with a definition, background explanation, "
                         "or any phrase that assumes the viewer is encountering this topic for the first time. "
-                        "The viewer already knows the concept — hit them with the SHOCKING IMPLICATION immediately."
+                        "The viewer already knows the concept — hit them with the SHOCKING IMPLICATION immediately. "
+                        "HOOK FORMULA REMINDER — use ONE of: "
+                        "(A) Specific outrage-inducing number/price + 1-line personal implication, "
+                        "(B) Rhetorical question with sarcastic tone hitting the viewer's wallet/time/dignity, "
+                        "(C) Strong negative word (절망/사기/증발/후회/Tuyệt vọng/Cú lừa/Bốc hơi) as the opening word."
                         + _HOOK_VISUAL_INSTRUCTION
                     )
 
@@ -2946,29 +3221,92 @@ with tab_main:
                     if add_loop_teaser:
                         retention_rules += "\n- LOOP ENDING: The LAST scene must call back to the opening hook."
                     if cta_style != "none":
-                        # Map CTA key → localized instruction matching the video language
-                        # CRITICAL: must NOT inject Vietnamese text when lang=Korean/English
-                        _cta_map = {
-                            "follow": {
-                                "Korean":     "팔로우해서 더 많은 정보를 받아보세요 (Follow for more)",
-                                "Vietnamese": "Follow để biết thêm",
-                                "English":    "Follow for more tips like this",
+                        # CTA: ONLY 1 sentence, must force a CHOICE or DEBATE — không dùng generic
+                        _cta_generic_example = {
+                            "follow":  {
+                                "Korean":     (
+                                    "마지막 장면 나레이션 맨 끝에 딱 1문장 CTA. "
+                                    "반드시 시청자가 '내 얘기다'라고 느끼고 댓글에 자기 입장을 쓰게 만드는 도발적인 선택지 질문으로 끝내세요. "
+                                    "✅ REQUIRED FORMULA: '[현재 상황 A]인가요, [현재 상황 B]인가요? 댓글에서 싸워봐요!' "
+                                    "✅ 예시: '월세파? 전세파? 지금 댓글로 싸워봐요!' "
+                                    "✅ 예시: '300만 원으로 서울에 집 살 수 있다고 생각해요? 솔직히 댓글로 남겨주세요.' "
+                                    "❌ ABSOLUTELY FORBIDDEN: '팔로우해주세요', '좋아요 눌러주세요', '구독 부탁드려요', '감사합니다', "
+                                    "'이 영상 어떠셨나요?', '여러분 생각은요?' (너무 일반적) — 1문장만, 선택지 있어야 함."
+                                ),
+                                "Vietnamese": (
+                                    "Kết thúc narration cảnh cuối bằng ĐÚNG 1 câu CTA. "
+                                    "Câu đó PHẢI buộc người xem chọn phe hoặc tranh luận — không được hỏi chung chung. "
+                                    "✅ REQUIRED FORMULA: '[Tình huống A] hay [Tình huống B]? Để lại bình luận!' "
+                                    "✅ Ví dụ: 'Bạn đang thuê hay đang tích lũy mua nhà? Tranh luận ở dưới đi!' "
+                                    "✅ Ví dụ: 'Lương bao nhiêu bạn mới dám nghĩ đến chuyện mua nhà? Nói thật đi!' "
+                                    "❌ TUYỆT ĐỐI CẤM: 'Follow để biết thêm', 'Like và share nhé', 'Cảm ơn bạn đã xem', "
+                                    "'Bạn nghĩ sao?' (quá chung chung) — Chỉ 1 câu, phải có 2 phe để chọn."
+                                ),
+                                "English": (
+                                    "End the LAST scene narration with EXACTLY 1 CTA sentence. "
+                                    "It MUST force the viewer to pick a side or reveal something personal — not a vague question. "
+                                    "✅ REQUIRED FORMULA: '[Option A] or [Option B] right now? Fight it out below!' "
+                                    "✅ Example: 'Team rent or team buy right now? Drop your honest answer below.' "
+                                    "✅ Example: 'What salary do you need before you'd even think about buying? Be honest.' "
+                                    "❌ ABSOLUTELY FORBIDDEN: 'Follow for more', 'Like and subscribe', 'Thanks for watching', "
+                                    "'What do you think?' (too generic) — 1 sentence only, must create a debate."
+                                ),
                             },
                             "comment": {
-                                "Korean":     "댓글로 여러분의 의견을 남겨주세요 (Leave a comment)",
-                                "Vietnamese": "Hãy để lại ý kiến của bạn dưới phần bình luận nhé",
-                                "English":    "Drop your thoughts in the comments",
+                                "Korean":     (
+                                    "마지막 나레이션 끝: 딱 1문장, 시청자가 자기 현실을 댓글에 털어놓게 만드는 질문. "
+                                    "✅ 예시: '지금 월급으로 5년 뒤 서울에 집 살 수 있을 것 같아요? 솔직하게 댓글로 알려주세요.' "
+                                    "✅ 예시: '전세 보증금 떼인 적 있거나 주변에 있으면 댓글로 알려주세요. 얼마나 많은지 확인해볼게요.' "
+                                    "❌ CẤM: '댓글로 의견 남겨주세요' (너무 공식적) — 반드시 구체적인 수치나 상황을 넣어야 함."
+                                ),
+                                "Vietnamese": (
+                                    "Cuối narration scene cuối: đúng 1 câu hỏi khiến người xem phải thú nhận thực tế của họ. "
+                                    "✅ Ví dụ: 'Tháng này bạn tiêu hết bao nhiêu % lương rồi? Nói thật ở dưới đi.' "
+                                    "✅ Ví dụ: 'Bạn đã bao giờ dùng hết tiền trước ngày lương chưa? 1 là Có, 2 là Không.' "
+                                    "❌ CẤM: 'Hãy để lại ý kiến', 'Bình luận bên dưới nhé' chung chung — phải có con số hoặc tình huống cụ thể."
+                                ),
+                                "English": (
+                                    "End last narration with exactly 1 question forcing personal confession. "
+                                    "✅ Example: 'Have you ever run out of money before payday? Reply: 1 for yes, 2 for never.' "
+                                    "✅ Example: 'What percentage of your income goes to rent right now? Drop the number below.' "
+                                    "❌ FORBIDDEN: 'Leave a comment', 'Share your thoughts' — must include specific number or situation."
+                                ),
                             },
                             "share": {
-                                "Korean":     "친구들과 공유해주세요 (Share with friends)",
-                                "Vietnamese": "Chia sẻ cho bạn bè của bạn",
-                                "English":    "Share this with someone who needs to hear it",
+                                "Korean":     (
+                                    "마지막 나레이션 끝: 이 영상을 반드시 봐야 할 특정 사람을 콕 집어서 공유를 유도하세요. "
+                                    "✅ 예시: '전세 계약 앞둔 친구 있으면 지금 당장 이 영상 보내주세요. 진짜로.' "
+                                    "✅ 예시: '부모님이 전세 보증금 빌려주겠다고 하면 — 먼저 이 영상 보여드리세요.' "
+                                    "❌ CẤM: '공유해주세요' 공식 문구 — 누구에게 왜 보내야 하는지 구체적이어야 함."
+                                ),
+                                "Vietnamese": (
+                                    "Cuối narration: tag cụ thể người CẦN xem video này để tạo share tự nhiên. "
+                                    "✅ Ví dụ: 'Bạn nào đang chuẩn bị ký hợp đồng thuê nhà — gửi video này cho họ đi. Thật sự đó.' "
+                                    "✅ Ví dụ: 'Ai đang cho con mượn tiền đặt cọc — hãy cho họ xem video này trước.' "
+                                    "❌ CẤM: 'Chia sẻ cho bạn bè' chung chung — phải nêu rõ ai và tại sao."
+                                ),
+                                "English": (
+                                    "End narration by calling out the EXACT type of person who NEEDS this video right now. "
+                                    "✅ Example: 'If you know someone about to sign a lease — send this to them right now. Seriously.' "
+                                    "✅ Example: 'Got a friend who thinks renting is 'throwing money away'? This is for them.' "
+                                    "❌ FORBIDDEN: Generic 'share with friends' — must name WHO and WHY they need it."
+                                ),
                             },
                         }
-                        _cta_localized = _cta_map.get(cta_style, {}).get(lang, f"Follow for more {lang} content")
-                        retention_rules += f'\n- CTA: You MUST append EXACTLY this phrase at the very end of the LAST scene narration: "{_cta_localized}". Do NOT change, translate, or rephrase it. Do NOT add it as a separate scene. Do NOT display it as on-screen text overlay.'
+                        _cta_instruction = _cta_generic_example.get(cta_style, {}).get(lang, "End the LAST scene with exactly 1 provocative question forcing viewers to pick a side in the comments.")
+                        retention_rules += f'\n- CTA (STRICT — LAST SCENE ONLY): {_cta_instruction}'
                     retention_rules += '\n- NEVER end with "Thank you for watching", "감사합니다", or "Cảm ơn".'
-                    retention_rules += '\n- ANTI-REPETITION: NEVER repeat the same idea, sentence, or phrase across scenes. Each scene MUST introduce NEW information. If a point was made in scene N, it MUST NOT appear again in any subsequent scene.'
+                    retention_rules += (
+                        '\n- ANTI-REPETITION (STRICT — ENFORCED): '
+                        'NEVER repeat the same idea, phrase, or concept across ANY scenes. '
+                        'Each scene MUST introduce 100% NEW information. '
+                        'FORBIDDEN cross-scene patterns: '
+                        '(1) Same causal statement restated differently (e.g. supply/demand → rewritten as price gap — SAME IDEA, forbidden). '
+                        '(2) Same emotional hook used twice (e.g. "You might lose your deposit" in scene 2 AND scene 5). '
+                        '(3) Any sentence where removing the scene number makes it indistinguishable from another scene. '
+                        'ENFORCEMENT: Before writing scene N, mentally check: "Did I say anything like this in scenes 1 to N-1?" '
+                        'If yes → replace it with a completely different angle (e.g. interest rates, tax policy, behavioral economics, real case study).'
+                    )
 
                     if lang == 'Korean':
                         lang_style_instruction = (
@@ -3096,10 +3434,39 @@ with tab_main:
                         f"  ❌ NEVER single words. ❌ NEVER URLs. ❌ NEVER industrial/factory/lab unless the topic is literally those things.\n"
                         f"  ✅ ALWAYS ask: 'Does this footage make sense to a viewer who just heard the narration?' If NO → choose again.\n"
                         f"\n"
-                        f"  === VEO 3 PROMPT ===\n"
-                        f"  - veo3_prompt: A highly detailed, cinematic English prompt for Google Veo 3 / Sora video generation.\n"
-                        f"  Describe lighting, camera angle, subject emotion, and background. (e.g. 'Cinematic close-up of a worried young man looking at bills, dramatic lighting, shallow depth of field, photorealistic, 4k')."
+
+                        f"  === MÔ TẢ CẢNH QUAY (VEO3 PROMPT) ===\n"
+                        f"  - veo3_prompt: Mô tả cảnh quay bằng tiếng Việt, rõ ràng, chi tiết để tạo video AI (Veo3/Sora/Kling).\n"
+                        f"  Cấu trúc: [Chủ thể + quốc tịch] + [hành động/trạng thái] + [bối cảnh, ánh sáng] + [góc máy] + [cảm xúc] + [chất lượng].\n"
+                        + (
+                            f"  QUỐC TỊCH NHÂN VẬT (BẮT BUỘC): Video dành cho khán giả {lang}.\n"
+                            f"  → Mọi nhân vật người trong cảnh PHẢI được chỉ rõ là "
+                            + ("'người Hàn Quốc' hoặc 'người Seoul'.\n"
+                               f"  → Ví dụ đúng: 'Cảnh quay gần mặt người đại lý bất động sản người Hàn đang giải thích cho cặp vợ chồng trẻ người Hàn'\n"
+                               f"  → Ví dụ SAI: 'người đàn ông trẻ' (không rõ quốc tịch)\n"
+                               if lang == "Korean" else
+                               "'người Việt Nam'.\n"
+                               f"  → Ví dụ đúng: 'Cảnh quay gần cô gái trẻ người Việt đang nhìn bảng giá căn hộ với vẻ lo lắng'\n"
+                               f"  → Ví dụ SAI: 'người phụ nữ trẻ' (không rõ quốc tịch)\n"
+                               if lang == "Vietnamese" else
+                               "'người phương Tây' hoặc chỉ rõ ethnicity nếu phù hợp chủ đề.\n"
+                            )
+                            if True else ""
+                        )
+                        + f"  Ví dụ mẫu ({lang}): "
+                        + ("'Cảnh quay gần mặt người đàn ông Hàn Quốc trung niên đang xem hợp đồng thuê nhà với vẻ lo lắng, ánh đèn vàng văn phòng, nền mờ, slow-motion, 4K cinematic.'\n"
+                           if lang == "Korean" else
+                           "'Cảnh quay gần cô gái người Việt đang nhìn bảng giá căn hộ tại trung tâm thành phố, ánh sáng buổi chiều, nền mờ đường phố Sài Gòn, slow-motion, chất lượng 4K.'\n"
+                           if lang == "Vietnamese" else
+                           "'Close-up of a young Western man reviewing a rental contract with a worried expression, warm office light, blurred background, slow-motion, 4K cinematic.'\n"
+                        )
+                        + f"  TUYỆT ĐỐI KHÔNG ĐƯỢC DÙNG trong veo3_prompt:\n"
+                        f"  ❌ Các từ nhạy cảm: quan chức, họp báo, hội nghị, cảnh sát, tòa án, chính trị, lãnh đạo chính phủ\n"
+                        f"  ❌ Tên tổ chức cụ thể (WEF, IMF, OECD...)\n"
+                        f"  ❌ Hình ảnh mạng, bạo lực, người nổi tiếng thật\n"
+                        f"  ✅ Thay bằng: cảnh đường phố, con người đời thường, nội thất văn phòng trung lập, biểu đồ số liệu, đồ vật, bảng giá."
                     )
+
 
                     if custom.strip():
                         topic_instruction = (
@@ -3168,23 +3535,118 @@ with tab_main:
                                 "  ❌ BANNED hook: '90% nguoi Viet gap tinh trang nay' (so lieu o scene 1 = nghe nhu doc bao cao)\n"
                                 "- Short punchy sentences. Max 10 words. Natural speech rhythm.\n"
                                 "- OK to use: 'ban biet khong', 'that ra', 'nghe co ve nghich ly', 'nhung ma', 'dieu dien ro la'\n"
-                                "- Rhetorical questions ONLY if answered in the SAME or NEXT scene."
+                                "- Rhetorical questions ONLY if answered in the SAME or NEXT scene.\n"
+                                "\n"
+                                "=== VIETNAMESE LANGUAGE & GRAMMAR PURITY (CRITICAL — HARD RULES) ===\n"
+                                "1. TARGET LANGUAGE: 100% tiếng Việt có dấu đầy đủ. Không viết tắt dấu (ban → bạn).\n"
+                                "2. NO HALLUCINATION: Dùng đúng từ chuẩn tiếng Việt. KHÔNG tự sáng tác từ không tồn tại.\n"
+                                "   Ví dụ đúng: 'tăng vọt', 'tụt dốc' — KHÔNG viết 'tăng vọt vọt' hay 'tụt dốc dốc'.\n"
+                                "3. NO STUTTERING: KHÔNG lặp từ liền kề do lỗi.\n"
+                                "   TUYỆT ĐỐI CẤM: 'của của', 'và và', 'trong trong', 'này này' — mỗi từ chỉ xuất hiện 1 lần.\n"
+                                "4. TONE: Nhà phân tích tài chính TikTok thật thà, đanh thép. Dùng: 'đó', 'nhé', 'thật ra', 'mà',\n"
+                                "   'chứ', 'á', 'vậy đó'. KHÔNG dùng văn mẫu: 'hãy cùng tìm hiểu', 'đây là điều quan trọng'.\n"
+                                "\n"
+                                "=== HOOK & CTA RULES (VIETNAMESE-SPECIFIC) ===\n"
+                                "- SCENE 1 (HOOK): Phải là Tuyên bố gây sốc hoặc Câu hỏi kích thích. Tối đa 1.5 giây.\n"
+                                "  CẤM mở đầu chung chung: 'Nhiều người thắc mắc...', 'Hôm nay mình sẽ chia sẻ...', 'Bạn có biết không?'.\n"
+                                "  ✅ ĐÚNG: 'Giá thuê nhà tăng 80% trong 3 năm. Lương bạn tăng bao nhiêu?'\n"
+                                "  ✅ ĐÚNG: 'Làm 10 tiếng/ngày nhưng thu nhập vẫn đứng im. Đây là lý do thật sự.'\n"
+                                "- SCENE END (CTA): Cảnh cuối PHẢI kết bằng câu hỏi khiêu khích ép người xem bình luận.\n"
+                                "  ✅ ĐÚNG: 'Bạn đang thuê hay đang tích lũy mua nhà? Chia sẻ phía dưới nhé!'\n"
+                                "  CẤM: 'Follow để biết thêm', 'Like và share ủng hộ mình nhé'.\n"
+                                "\n"
+                                "=== ANTI-REPETITION (STRICT — VIETNAMESE) ===\n"
+                                "Mỗi scene PHẢI đưa ra thông tin HOÀN TOÀN MỚI.\n"
+                                "KHÔNG lặp lại cùng khái niệm (ví dụ 'cung cầu mất cân bằng') ở nhiều scene.\n"
+                                "Nếu Scene 2 đề cập đến X, Scene 3 PHẢI nói về điều khác (ví dụ: lãi suất, thuế, chính sách)."
                             )
                         elif lang == "Korean":
                             speech_rules = (
-                                "KOREAN SPEECH STYLE:\n"
-                                "- Write in natural 해요체, conversational like a Korean YouTuber.\n"
-                                "- Use engaging phrases: '알고 계셨나요?', '사실은', '충격적인 건', '여기서 반전이', '근데 진짜로'\n"
-                                "- Short sentences. Each scene = 1 clear point.\n"
-                                "- AVOID textbook Korean, overly polite 습니다체, robotic phrasing."
+                                "KOREAN SPEECH STYLE — PERSONA: 길거리 전문가 / 파이낸스 Vlogger (CRITICAL):\n"
+                                "\n"
+                                "=== 필수 사용 — SPOKEN KOREAN ENDINGS (최소 2개/scene) ===\n"
+                                "~잖아요  → '비싸잖아요' (You know it's expensive, right?)\n"
+                                "~죠?     → '이상하죠?' (Weird, right?)\n"
+                                "~지 않을까요? → '문제가 되지 않을까요?' (Wouldn't that be a problem?)\n"
+                                "~다는 사실!  → '오르고 있다는 사실!' (The fact that it's rising!)\n"
+                                "~거든요  → '이게 핵심이거든요' (This is the key point, see)\n"
+                                "~는데요  → '근데 여기서 반전이 있는데요' (But here's the twist)\n"
+                                "\n"
+                                "=== 감탄사 — RHYTHM BREAKERS (매 2–3 scene마다 1개) ===\n"
+                                "'하...', '진짜로', '솔직히 말해서', '어이없죠?', '웃긴 건', '근데 이게'\n"
+                                "\n"
+                                "=== ABSOLUTE BANS ===\n"
+                                "❌ '우리는 ... 해야 해요' (We must...)\n"
+                                "❌ '단순한 문제가 아니에요' (It's not a simple issue)\n"
+                                "❌ '중요한 것은' / '핵심은 바로' — clichéd openers\n"
+                                "❌ 습니다체 endings in narration\n"
+                                "❌ Any sentence that could apply to ANY topic without changing words\n"
+                                "\n"
+                                "=== LANGUAGE PURITY — HARD RULE (VIOLATIONS = OUTPUT REJECTED) ===\n"
+                                "✅ 100% 순수 한국어 (Hangul) only.\n"
+                                "✅ Economic terms ALLOWED in English ONLY: OECD, FED, LTV, GDP, DSR, RTI\n"
+                                "❌ STRICTLY FORBIDDEN: Any Chinese character (Hanja: 真的, 正直, 方法...)\n"
+                                "❌ STRICTLY FORBIDDEN: Any Japanese Hiragana or Katakana\n"
+                                "❌ STRICTLY FORBIDDEN: Any Vietnamese or other non-Korean text\n"
+                                "→ If you are unsure whether a word is pure Korean, write it in Hangul romanization instead.\n"
+                                "\n"
+                                "=== KOREAN LANGUAGE & GRAMMAR PURITY (CRITICAL — HARD RULES) ===\n"
+                                "1. TARGET LANGUAGE: 100% Native, natural Korean (Hangul). Zero mixing.\n"
+                                "2. NO HALLUCINATION: Ensure absolute grammatical correctness. Do NOT invent fake or misspelled words\n"
+                                "   (e.g., use '치솟고' NOT the misspelled '취속고', use '이를' NOT '이를 이를').\n"
+                                "3. NO CHINESE CHARACTERS: Absolutely NO Hanja (Chinese characters) anywhere in the output.\n"
+                                "4. NO STUTTERING: Do NOT repeat any word consecutively by accident\n"
+                                "   (e.g., NEVER write '이를 이를', '그래서 그래서', '사람 사람' — write each word ONCE).\n"
+                                "5. TONE: Aggressive, street-smart financial analyst on TikTok. Use informal/polite punchy endings\n"
+                                "   (~잖아요, ~죠, ~지 않나요?). DO NOT use robotic endings like '단순한 문제가 아니에요'.\n"
+                                "\n"
+                                "=== HOOK & CTA RULES (KOREAN-SPECIFIC) ===\n"
+                                "- SCENE 1 (HOOK): Must be a Shocking Claim or Agitating Question. Max 1.5 seconds of speech.\n"
+                                "  NO generic openers like '많은 사람들이 궁금해합니다' or '오늘은 ~에 대해 알아볼게요'.\n"
+                                "  ✅ CORRECT: '서울 아파트 전세금이 5년 만에 두 배가 됐잖아요. 근데 월급은요?'\n"
+                                "  ✅ CORRECT: '집주인이 지금 당신의 보증금으로 빚을 갚고 있을 수도 있습니다.'\n"
+                                "- SCENE END (CTA): The final scene MUST end with a provocative question driving comments.\n"
+                                "  ✅ CORRECT: '여러분은 어떻게 생각하세요? 댓글로 남겨주세요!'\n"
+                                "  ✅ CORRECT: '월세파? 전세파? 댓글에서 싸워봐요.'\n"
+                                "  NEVER use generic '팔로우해주세요' or '좋아요 눌러주세요'.\n"
+                                "\n"
+                                "=== ANTI-REPETITION (STRICT — KOREAN) ===\n"
+                                "Each scene MUST introduce completely NEW information.\n"
+                                "Do NOT repeat the same concept (e.g., '수요와 공급의 불균형') across multiple scenes.\n"
+                                "If Scene 2 mentions a concept, Scene 3 MUST cover something different (e.g., interest rates, taxes, policy)."
                             )
                         else:
                             speech_rules = (
-                                "ENGLISH SPEECH STYLE:\n"
+                                "ENGLISH SPEECH STYLE — ANTI-GENERIC RULES (CRITICAL):\n"
                                 "- Write like a top TikTok narrator: conversational, punchy, direct.\n"
                                 "- Use: 'Here's the thing', 'But wait', 'The crazy part is', 'Nobody talks about this', 'And that's when'\n"
                                 "- Short sentences. Fragments OK for emphasis. 'Like this.'\n"
-                                "- NEVER start with 'In this video' or 'Today I'm going to'."
+                                "- NEVER start with 'In this video' or 'Today I'm going to'.\n"
+                                "\n"
+                                "=== ENGLISH LANGUAGE & GRAMMAR PURITY (CRITICAL — HARD RULES) ===\n"
+                                "1. TARGET LANGUAGE: 100% native, natural English. No mixing with other languages.\n"
+                                "2. NO HALLUCINATION: Use only real, correctly-spelled English words. Do NOT invent words.\n"
+                                "   (e.g., use 'skyrocketing' NOT 'skyrocketting', use 'occurred' NOT 'occured').\n"
+                                "3. NO STUTTERING: Do NOT repeat any word consecutively by accident.\n"
+                                "   ABSOLUTELY FORBIDDEN: 'the the', 'and and', 'that that' — each word ONCE only.\n"
+                                "4. TONE: Aggressive, street-smart financial analyst on TikTok. Use punchy connectors:\n"
+                                "   'Here's the thing', 'But wait', 'Think about it', 'Nobody tells you this'.\n"
+                                "   DO NOT use: 'It is important to note', 'In conclusion', 'As you can see'.\n"
+                                "\n"
+                                "=== HOOK & CTA RULES (ENGLISH-SPECIFIC) ===\n"
+                                "- SCENE 1 (HOOK): Must be a Shocking Claim or Agitating Question. Max 1.5 seconds of speech.\n"
+                                "  NO generic openers like 'Many people wonder...' or 'Today we will discuss...'.\n"
+                                "  ✅ CORRECT: 'Rent prices jumped 40% in 3 years. Your salary? Maybe 5%.'\n"
+                                "  ✅ CORRECT: 'Your landlord is paying off their mortgage with YOUR deposit right now.'\n"
+                                "- SCENE END (CTA): The final scene MUST end with a provocative question forcing comments.\n"
+                                "  ✅ CORRECT: 'Team rent or team buy right now? Drop it below.'\n"
+                                "  ✅ CORRECT: 'With your salary, when do you think you can afford a home? Be honest.'\n"
+                                "  NEVER use: 'Follow for more', 'Like and subscribe', 'Share with your friends'.\n"
+                                "\n"
+                                "=== ANTI-REPETITION (STRICT — ENGLISH) ===\n"
+                                "Each scene MUST introduce completely NEW information.\n"
+                                "Do NOT repeat the same concept (e.g., 'supply and demand imbalance') across multiple scenes.\n"
+                                "If Scene 2 mentions a concept, Scene 3 MUST cover something different (e.g., interest rates, taxes, policy)."
                             )
 
                         # ── Retention framework: Shorts có triết lý riêng với Long video ──
@@ -3287,7 +3749,7 @@ with tab_main:
                             format_str = (
                                 f'{{"title":"viral title in {lang} (max 60 chars, curiosity-driven)","description":"SEO description in {lang}",'\
                                 f'"tags":["t1","t2"],"scenes":[{{"id":1,"text":"narration STRICTLY in {lang}",'\
-                                f'"keyword":{kw_example},"veo3_prompt":"detailed cinematic English prompt for Veo 3","retention_note":"why viewer stays"}}]}}'
+                                f'"keyword":{kw_example},"veo3_prompt":"[Tiếng Việt] Mô tả cảnh quay rõ ràng: chủ thể, hành động, bối cảnh, góc máy, cảm xúc, ánh sáng (không dùng từ nhạy cảm)","retention_note":"why viewer stays"}}]}}'
                             )
                         else:
                             end_note = ("FINAL BATCH — close all loops, deliver the payoff, apply CTA." if is_last else "Keep 1 open loop at the end to pull viewer to the next scene.")
@@ -3301,7 +3763,7 @@ with tab_main:
                             )
                             format_str = (
                                 f'{{"scenes":[{{"id":{batch_start},"text":"narration STRICTLY in {lang}",'\
-                                f'"keyword":{kw_example},"veo3_prompt":"detailed cinematic English prompt for Veo 3","retention_note":"why viewer stays"}}]}}'
+                                f'"keyword":{kw_example},"veo3_prompt":"[Tiếng Việt] Mô tả cảnh quay rõ ràng: chủ thể, hành động, bối cảnh, góc máy, cảm xúc, ánh sáng (không dùng từ nhạy cảm)","retention_note":"why viewer stays"}}]}}'
                             )
 
                         if lang == "Vietnamese":
@@ -3417,6 +3879,14 @@ with tab_main:
                         if batch_scenes:
                             for bi, bsc in enumerate(batch_scenes):
                                 bsc["id"] = scene_cursor + bi + 1
+                                # ── CLEANUP: xóa lặp từ liền kề và khoảng trắng thừa do AI lỗi ──
+                                # Ví dụ: '이를 이를' → '이를', '  ' → ' '
+                                _raw_text = bsc.get("text", "")
+                                _cleaned  = re.sub(r'\b(\w+)( \1\b)+', r'\1', _raw_text)
+                                _cleaned  = " ".join(_cleaned.split())
+                                if _cleaned != _raw_text:
+                                    print(f"[Cleanup] Scene {bsc['id']}: fixed repeated words — '{_raw_text[:80]}' → '{_cleaned[:80]}'")
+                                bsc["text"] = _cleaned
                             all_scene_data.extend(batch_scenes)
                             last_text    = batch_scenes[-1].get("text", "")
                             prev_summary = last_text[:200] if last_text else ""
@@ -3430,6 +3900,68 @@ with tab_main:
                         if scene_cursor < total_scenes_needed:
                             log(f"  ⏳ Đợi 12s trước batch tiếp theo (tránh rate limit)...")
                             time.sleep(12)
+
+                    # ── POST-PROCESS: Dedup câu kết tương tự cấu trúc ──────────────
+                    # Phát hiện và làm mờ câu kết ở các scene khác nhau nếu chúng có cùng cấu trúc
+                    # (ví dụ: nhiều scene cùng kết bằng "Bạn nghĩ sao? Để lại bình luận nhé!")
+                    def _dedup_similar_endings(scenes: list) -> list:
+                        """Xóa bỏ câu kết bị trùng cấu trúc giữa các scene.
+                        Nếu scene N và scene M (M < N) có câu kết cùng ≥ 70% từ khóa chung
+                        thì câu kết của scene N bị xóa bỏ (giữ lại nội dung, bỏ câu cuối trùng).
+                        KHÔNG áp dụng cho scene cuối (CTA scene được bảo vệ).
+                        """
+                        import re as _re2
+
+                        def _normalize(s: str) -> set:
+                            """Trả về tập từ khóa có nghĩa (loại stopword ngắn)."""
+                            _stop = {"và", "hay", "hoặc", "là", "của", "trong", "với", "bạn", "mình",
+                                     "the", "a", "an", "is", "are", "to", "of", "and", "or", "in",
+                                     "이", "가", "을", "를", "은", "는", "의", "에", "로", "에서"}
+                            tokens = set(_re2.sub(r'[^\w\s]', '', s.lower()).split())
+                            return tokens - _stop
+
+                        def _last_sentence(text: str) -> str:
+                            """Lấy câu cuối cùng của text."""
+                            # Tách theo dấu câu kết thúc
+                            parts = _re2.split(r'(?<=[.!?])\s+', text.strip())
+                            return parts[-1].strip() if parts else text.strip()
+
+                        if len(scenes) <= 1:
+                            return scenes
+
+                        seen_endings: list = []  # list of (normalized_set, scene_idx)
+                        SIMILARITY_THRESHOLD = 0.65  # ≥65% từ khóa chung = trùng
+
+                        for idx, sc in enumerate(scenes[:-1]):  # Bảo vệ scene cuối (CTA)
+                            text = sc.get("text", "")
+                            last_sent = _last_sentence(text)
+                            last_kws  = _normalize(last_sent)
+                            if len(last_kws) < 3:
+                                continue  # câu quá ngắn, bỏ qua
+
+                            for prev_kws, prev_idx in seen_endings:
+                                if not prev_kws:
+                                    continue
+                                intersection = len(last_kws & prev_kws)
+                                union        = len(last_kws | prev_kws)
+                                similarity   = intersection / union if union > 0 else 0
+                                if similarity >= SIMILARITY_THRESHOLD:
+                                    # Xóa câu cuối trùng: giữ phần còn lại
+                                    sentences = _re2.split(r'(?<=[.!?])\s+', text.strip())
+                                    if len(sentences) > 1:
+                                        new_text = ' '.join(sentences[:-1]).strip()
+                                        sc["text"] = new_text
+                                        print(f"[Dedup] Scene {sc.get('id','?')}: removed similar ending "
+                                              f"(sim={similarity:.0%} with scene {scenes[prev_idx].get('id','?')}): "
+                                              f"'{last_sent[:60]}'")
+                                    break  # Đã xử lý, không cần check tiếp
+
+                            seen_endings.append((last_kws, idx))
+
+                        return scenes
+
+                    all_scene_data = _dedup_similar_endings(all_scene_data)
+                    log(f"  🧹 Dedup endings: kiểm tra {len(all_scene_data)} cảnh (câu kết trùng sẽ bị xóa tự động)")
 
                     # ── Fallback: nếu AI batch 1 không trả title/desc/tags → gọi riêng ──
                     if not video_title.strip() or not video_description.strip() or not video_tags:
@@ -3516,15 +4048,16 @@ with tab_main:
                         else:
                             veo3_path = None
                         scenes.append({
-                            "id":        sc_data["id"],
-                            "text":      sc_data["text"],
-                            "keyword":   sc_data["keyword"],
-                            "videoUrl":  vid_url,
-                            "veo3Path":  veo3_path,    # ← local path nếu dùng Veo3
-                            "imageUrl":  img_url,
-                            "audioDone": False,
-                            "targetDur": float(target_sec_per_scene),
-                            "duration":  round(max(float(target_sec_per_scene), len(sc_data["text"].split()) / words_per_sec + 0.4), 1),
+                            "id":          sc_data["id"],
+                            "text":        sc_data["text"],
+                            "keyword":     sc_data["keyword"],
+                            "veo3_prompt": sc_data.get("veo3_prompt", ""),  # ← prompt AI gen sẵn từ kịch bản
+                            "videoUrl":    vid_url,
+                            "veo3Path":    veo3_path,    # ← local path nếu dùng Veo3
+                            "imageUrl":    img_url,
+                            "audioDone":   False,
+                            "targetDur":   float(target_sec_per_scene),
+                            "duration":    round(max(float(target_sec_per_scene), len(sc_data["text"].split()) / words_per_sec + 0.4), 1),
                         })
                     proj.update({"script": script, "scenes": scenes, "step": 1, "lang": lang})
                     save_proj(proj)
@@ -3552,7 +4085,37 @@ with tab_main:
                     st.rerun()
                 else:
                     script = proj["script"]
-                    scenes = proj["scenes"]
+                    scenes = proj.get("scenes") or []
+
+                    # ── FIX: Nếu scenes rỗng (do Import JSON từ ChatGPT) → build từ script ──
+                    # Luồng tự động (gen_script) đã build scenes trong STEP 1.
+                    # Luồng Import JSON chỉ set proj["script"] chứ không build scenes.
+                    # → Cần rebuild ở đây để STEP 2 (Footage) có dữ liệu để chạy.
+                    if not scenes and script and script.get("scenes"):
+                        log("🔄 Phát hiện JSON imported — đang khởi tạo scenes từ kịch bản...")
+                        _wps_map       = {"Vietnamese": 3.8, "Korean": 2.2, "English": 2.2}
+                        _words_per_sec = _wps_map.get(lang, 2.2) * float(tts_rate)
+
+                        for sc_data in script["scenes"]:
+                            scenes.append({
+                                "id":          sc_data.get("id", len(scenes) + 1),
+                                "text":        sc_data.get("text", ""),
+                                "keyword":     sc_data.get("keyword", niche),
+                                "veo3_prompt": sc_data.get("veo3_prompt", ""),
+                                "videoUrl":    None,
+                                "veo3Path":    None,
+                                "imageUrl":    None,
+                                "audioDone":   False,
+                                "targetDur":   float(target_sec_per_scene),
+                                "duration":    round(
+                                    max(float(target_sec_per_scene),
+                                        len(sc_data.get("text", "").split()) / max(_words_per_sec, 0.1) + 0.4),
+                                    1
+                                ),
+                            })
+                        proj.update({"scenes": scenes, "lang": lang, "step": 1})
+                        save_proj(proj)
+                        log(f"✅ Đã khởi tạo {len(scenes)} cảnh từ JSON — bắt đầu STEP 2 (Footage)...")
 
                 # STEP 2: Footage
                 if run_all:
@@ -3842,11 +4405,13 @@ with tab_main:
                                     _hh, _mm, _ss = _ts.split(":")
                                     _real_dur = int(_hh)*3600 + int(_mm)*60 + float(_ss)
                                     if _real_dur > 0.5:
-                                        dur = max(1.5, round(_real_dur + 0.3, 1))
+                                        # Buffer tối thiểu để không cắt tiếng cuối câu
+                                        # 0.05s thay vì 0.3s cũ — giảm dôi thời gian khi concat nhiều cảnh
+                                        dur = max(1.5, round(_real_dur + 0.05, 2))
                                     break
                         except Exception:
                             pass
-                        log(f"  ⏱ Cảnh {i+1}: audio={dur-0.3:.1f}s → scene={dur:.1f}s (stored was {stored_dur:.1f}s)")
+                        log(f"  ⏱ Cảnh {i+1}: audio={dur-0.05:.2f}s → scene={dur:.2f}s (stored was {stored_dur:.1f}s)")
 
                     # ── AUDIO: Trim/pad đúng `dur` giây và ép chuẩn Stereo/44100Hz ──
                     audio_path = s_dir / "audio_trimmed.aac"
@@ -4131,27 +4696,50 @@ with tab_main:
                                 "-shortest", "-y", str(base_out)
                             ]
 
-                    ffmpeg(*ffmpeg_cmd)
+                    # ── Tính fade filter string ──
+                    _fade_str = f",fade=t=in:st=0:d=0.15,fade=t=out:st={max(0.0, dur-0.15):.3f}:d=0.15" if enable_transition else ""
 
-                    # ----- SUBTITLE BURN-IN -----
-                    if has_srt and ass_local and ass_local.exists():
-                        log(f"  ✍️ Đang gắn phụ đề cảnh {i+1}...")
-                        vf_filter = _sub_filter(ass_local)
-                        if enable_transition:
-                            vf_filter += f",fade=t=in:st=0:d=0.15,fade=t=out:st={dur-0.15}:d=0.15"
-                        cmd_args = ["-i", str(base_out), "-vf", vf_filter, "-c:v", "libx264", "-preset", "fast", "-crf", "22", "-c:a", "copy", "-y", str(out)]
+                    # ── Quyết định chiến lược render ──
+                    # has_srt = cần subtitle pass → luôn phải output pass 1 ra base_out
+                    # Không có subtitle + video thường → merge fade vào pass 1, output thẳng ra out (1 pass)
+                    _is_plain_video = has_vid and not is_image_file(str(vid_path))
+                    _need_pass2 = (has_srt and ass_local and ass_local.exists())
+
+                    if _is_plain_video and not _need_pass2 and _fade_str:
+                        # Tối ưu: 1 pass duy nhất — merge fade vào scale_crop, output → out
                         try:
-                            ffmpeg(*cmd_args)
-                        except Exception as e:
-                            log(f"  ⚠️ Lỗi gắn phụ đề: {e} → dùng bản không phụ đề.")
-                            shutil.copy(base_out, out)
+                            vf_idx = ffmpeg_cmd.index("-vf")
+                            ffmpeg_cmd[vf_idx + 1] = scale_crop + _fade_str
+                            ffmpeg_cmd[-1] = str(out)   # output trực tiếp ra out
+                        except (ValueError, IndexError):
+                            pass
+                        ffmpeg(*ffmpeg_cmd)
                     else:
-                        if enable_transition:
-                            v_fade = f"fade=t=in:st=0:d=0.15,fade=t=out:st={dur-0.15}:d=0.15"
-                            cmd_args = ["-i", str(base_out), "-vf", v_fade, "-c:v", "libx264", "-preset", "fast", "-crf", "22", "-c:a", "copy", "-y", str(out)]
-                            ffmpeg(*cmd_args)
+                        # Bình thường: pass 1 → base_out
+                        ffmpeg(*ffmpeg_cmd)
+
+                        # ----- SUBTITLE BURN-IN (pass 2) -----
+                        if _need_pass2:
+                            log(f"  ✍️ Đang gắn phụ đề cảnh {i+1}...")
+                            vf_filter = _sub_filter(ass_local) + _fade_str
+                            cmd_args = ["-i", str(base_out), "-vf", vf_filter,
+                                        "-c:v", "libx264", "-preset", "fast", "-crf", "22",
+                                        "-c:a", "copy", "-y", str(out)]
+                            try:
+                                ffmpeg(*cmd_args)
+                            except Exception as e:
+                                log(f"  ⚠️ Lỗi gắn phụ đề: {e} → dùng bản không phụ đề.")
+                                shutil.copy(base_out, out)
                         else:
-                            shutil.copy(base_out, out)
+                            # Không có subtitle, cần copy/fade từ base_out → out
+                            if _fade_str:
+                                v_fade_only = _fade_str.lstrip(",")  # bỏ dấu phẩy đầu
+                                cmd_args = ["-i", str(base_out), "-vf", v_fade_only,
+                                            "-c:v", "libx264", "-preset", "fast", "-crf", "22",
+                                            "-c:a", "copy", "-y", str(out)]
+                                ffmpeg(*cmd_args)
+                            else:
+                                shutil.copy(base_out, out)
 
                     # ── Sound Effect: auto-random nếu chưa chọn ──
                     sfx_name = s.get("soundEffect")
@@ -4365,7 +4953,7 @@ with tab_main:
             scenes = proj.get("scenes", [])
             total_scenes = len(scenes)
             edited = False
-            
+
             if total_scenes > 0:
                 # Progress Bar
                 completed_count = sum(1 for sc in scenes if sc.get("completed"))
@@ -4575,8 +5163,156 @@ with tab_main:
                             else:
                                 new_kw = user_kw
 
+                            # ── Auto-fetch footage tự động khi chưa có nền ────────────────────
+                            _has_footage = (scene.get("videoUrl") or scene.get("imageUrl")
+                                           or scene.get("customVid") or scene.get("customImg"))
+                            _auto_done_key = f"auto_vid_done_{proj.get('id','')}{idx}"
+                            _pexels_key_av = (cfg.get("pexels") or [None])[0]
+
+                            if not _has_footage and new_kw and _pexels_key_av \
+                                    and not st.session_state.get(_auto_done_key):
+                                # Chưa fetch lần nào — tự động fetch ngay
+                                _use_ai_auto = st.session_state.get("use_ai_images_confirm",
+                                               st.session_state.get("use_ai_images_main", True))
+                                _is_photo_scene = (idx > 0) and (idx % 3 == 2) and not _use_ai_auto
+                                _opt_auto = optimize_query_for_region(new_kw, new_region)
+                                with st.spinner(f"⚡ Đang tự chọn {'ảnh' if _is_photo_scene else 'video'} cho cảnh {idx+1}..."):
+                                    try:
+                                        if _is_photo_scene:
+                                            _res_auto = search_pexels_photos_only(
+                                                _opt_auto,
+                                                orientation="portrait" if "9:16" in aspect else "landscape"
+                                            )
+                                        else:
+                                            _res_auto = search_pexels_videos(
+                                                _opt_auto,
+                                                orientation="portrait" if "9:16" in aspect else "landscape"
+                                            )
+                                        _pick_auto = next((r for r in (_res_auto or []) if not r.get("already_used")), None)
+                                        if not _pick_auto and _res_auto:
+                                            _pick_auto = _res_auto[0]
+                                        if _pick_auto:
+                                            if _is_photo_scene:
+                                                proj["scenes"][idx]["imageUrl"]  = _pick_auto["url"]
+                                                proj["scenes"][idx]["videoUrl"]  = None
+                                            else:
+                                                proj["scenes"][idx]["videoUrl"]  = _pick_auto["url"]
+                                                proj["scenes"][idx]["duration"]  = _pick_auto.get("duration", scene.get("duration", 5))
+                                                proj["scenes"][idx]["imageUrl"]  = None
+                                            proj["scenes"][idx]["customVid"] = None
+                                            proj["scenes"][idx]["customImg"] = None
+                                            if "used_videos" not in cfg:
+                                                cfg["used_videos"] = []
+                                            if _pick_auto["url"] not in cfg["used_videos"]:
+                                                cfg["used_videos"].append(_pick_auto["url"])
+                                            save_cfg(cfg)
+                                            save_proj(proj)
+                                        # Đánh dấu đã fetch dù kết quả thế nào
+                                        st.session_state[_auto_done_key] = True
+                                        st.rerun()
+                                    except Exception as _ae:
+                                        st.session_state[_auto_done_key] = True  # tránh loop lỗi
+
+                            # ── Nút override thủ công (luôn hiện khi chưa có custom) ──────────
+                            if not _has_footage:
+                                _auto_col1, _auto_col2 = st.columns([1, 1])
+                                with _auto_col1:
+                                    if st.button("⚡ Auto-chọn Video (Pexels)", key=f"auto_vid_{idx}",
+                                                  use_container_width=True,
+                                                  help="Tìm lại và chọn video Pexels khác"):
+                                        if new_kw and _pexels_key_av:
+                                            with st.spinner(f"⚡ Đang chọn video cho cảnh {idx+1}..."):
+                                                _opt = optimize_query_for_region(new_kw, new_region)
+                                                _res = search_pexels_videos(_opt, orientation="portrait" if "9:16" in aspect else "landscape")
+                                                _pick = next((r for r in (_res or []) if not r.get("already_used")), None) or (_res[0] if _res else None)
+                                                if _pick:
+                                                    proj["scenes"][idx]["videoUrl"] = _pick["url"]
+                                                    proj["scenes"][idx]["duration"] = _pick.get("duration", scene.get("duration", 5))
+                                                    proj["scenes"][idx]["imageUrl"] = proj["scenes"][idx]["customVid"] = proj["scenes"][idx]["customImg"] = None
+                                                    if "used_videos" not in cfg: cfg["used_videos"] = []
+                                                    if _pick["url"] not in cfg["used_videos"]: cfg["used_videos"].append(_pick["url"])
+                                                    save_cfg(cfg); save_proj(proj)
+                                                    st.session_state[_auto_done_key] = True
+                                                    st.rerun()
+                                with _auto_col2:
+                                    if st.button("⚡ Auto-chọn Ảnh (Pexels)", key=f"auto_img_{idx}",
+                                                  use_container_width=True,
+                                                  help="Tìm lại và chọn ảnh Pexels (Ken Burns)"):
+                                        if new_kw and _pexels_key_av:
+                                            with st.spinner(f"⚡ Đang chọn ảnh cho cảnh {idx+1}..."):
+                                                _opt = optimize_query_for_region(new_kw, new_region)
+                                                _res = search_pexels_photos_only(_opt, orientation="portrait" if "9:16" in aspect else "landscape")
+                                                _pick = next((r for r in (_res or []) if not r.get("already_used")), None) or (_res[0] if _res else None)
+                                                if _pick:
+                                                    proj["scenes"][idx]["imageUrl"] = _pick["url"]
+                                                    proj["scenes"][idx]["videoUrl"] = proj["scenes"][idx]["customVid"] = proj["scenes"][idx]["customImg"] = None
+                                                    if "used_videos" not in cfg: cfg["used_videos"] = []
+                                                    if _pick["url"] not in cfg["used_videos"]: cfg["used_videos"].append(_pick["url"])
+                                                    save_cfg(cfg); save_proj(proj)
+                                                    st.session_state[_auto_done_key] = True
+                                                    st.rerun()
+
+                            # ── Chọn video từ máy — nằm ngoài tabs, luôn visible ──
+                            with st.expander("📁 Dùng video từ máy", expanded=False):
+                                _local_vid_scan_dirs = [
+                                    Path.home() / "Documents" / "99999",
+                                    Path.home() / "Desktop",
+                                    Path.home() / "Downloads",
+                                    Path.home() / "Movies",
+                                ]
+                                _local_vid_found = {"(Không chọn)": ""}
+                                for _lvd in _local_vid_scan_dirs:
+                                    if _lvd.exists():
+                                        for _ext in ["*.mp4", "*.mov", "*.mkv", "*.avi"]:
+                                            for _lvf in sorted(_lvd.glob(_ext)):
+                                                _lv_label = f"{_lvf.name}  [{_lvd.name}/]"
+                                                _local_vid_found[_lv_label] = str(_lvf)
+                                _local_vid_opts = list(_local_vid_found.keys())
+                                _lv_col1, _lv_col2 = st.columns([3, 1])
+                                with _lv_col1:
+                                    _local_vid_sel = st.selectbox(
+                                        "📂 Chọn file video có sẵn:",
+                                        _local_vid_opts,
+                                        key=f"local_vid_sel_{idx}",
+                                        help="Quét tự động: Documents/99999, Desktop, Downloads, Movies"
+                                    )
+                                    _local_vid_manual = st.text_input(
+                                        "✏️ Hoặc dán đường dẫn file:",
+                                        placeholder="/Users/you/Videos/myvideo.mp4",
+                                        key=f"local_vid_path_{idx}"
+                                    )
+                                with _lv_col2:
+                                    st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+                                    if st.button("✅ Áp dụng", key=f"apply_local_vid_{idx}", type="primary", use_container_width=True):
+                                        _chosen_path = st.session_state.get(f"local_vid_path_{idx}", "").strip() or _local_vid_found.get(_local_vid_sel, "")
+                                        if _chosen_path and Path(_chosen_path).exists():
+                                            proj["scenes"][idx]["customVid"] = _chosen_path
+                                            proj["scenes"][idx]["customImg"] = None
+                                            proj["scenes"][idx]["imageUrl"]  = None
+                                            proj["scenes"][idx]["videoUrl"]  = None
+                                            # ── Probe duration nhanh: chỉ đọc metadata header, không decode ──
+                                            try:
+                                                _ffprobe = FFMPEG.replace("ffmpeg", "ffprobe")
+                                                _probe = subprocess.run(
+                                                    [_ffprobe, "-v", "error",
+                                                     "-show_entries", "format=duration",
+                                                     "-of", "default=noprint_wrappers=1:nokey=1",
+                                                     _chosen_path],
+                                                    capture_output=True, text=True, timeout=5
+                                                )
+                                                _dur_str = _probe.stdout.strip()
+                                                if _dur_str and _dur_str not in ("N/A", ""):
+                                                    proj["scenes"][idx]["duration"] = round(float(_dur_str))
+                                            except Exception:
+                                                pass  # giữ nguyên duration cũ nếu probe lỗi
+                                            save_proj(proj)
+                                            st.success(f"✅ Đã dùng: {Path(_chosen_path).name}")
+                                            st.rerun()
+                                        else:
+                                            st.error("❌ Không tìm thấy file — kiểm tra lại đường dẫn.")
+
                             tab_pexels_vid, tab_pixabay_vid, tab_coverr_vid, tab_pexels_photo, tab_pixabay_photo, tab_upload = st.tabs([
-                                "📹 Pexels Video", "📹 Pixabay Video", "📹 Coverr Video", 
+                                "📹 Pexels Video", "📹 Pixabay Video", "📹 Coverr Video",
                                 "🖼️ Pexels Photo", "🖼️ Pixabay Photo", "📤 Upload"
                             ])
                             
@@ -4589,7 +5325,14 @@ with tab_main:
                                     opt_kw = optimize_query_for_region(new_kw, new_region)
                                     if opt_kw != new_kw:
                                         st.caption(f"💡 Từ khóa tối ưu vùng miền: `{opt_kw}`")
-                                    if st.button("🔎 Tìm Pexels Video", key=f"search_pexels_btn_{idx}"):
+                                    # Auto-search nếu chưa có kết quả và có keyword
+                                    if st.session_state.get(f"pexels_vid_{idx}") is None and opt_kw:
+                                        with st.spinner("🔍 Đang tìm Pexels Video tự động..."):
+                                            st.session_state[f"pexels_vid_{idx}"] = search_pexels_videos(
+                                                opt_kw,
+                                                orientation="portrait" if "9:16" in aspect else "landscape"
+                                            )
+                                    if st.button("🔄 Tìm lại Pexels Video", key=f"search_pexels_btn_{idx}"):
                                         with st.spinner("Đang tìm video trên Pexels..."):
                                             st.session_state[f"pexels_vid_{idx}"] = search_pexels_videos(
                                                 opt_kw,
@@ -4636,7 +5379,13 @@ with tab_main:
                                     opt_kw = optimize_query_for_region(new_kw, new_region)
                                     if opt_kw != new_kw:
                                         st.caption(f"💡 Từ khóa tối ưu vùng miền: `{opt_kw}`")
-                                    if st.button("🔎 Tìm Pixabay Video", key=f"search_pix_btn_{idx}"):
+                                    if st.session_state.get(f"pix_vid_{idx}") is None and opt_kw:
+                                        with st.spinner("🔍 Đang tìm Pixabay Video tự động..."):
+                                            st.session_state[f"pix_vid_{idx}"] = search_pixabay_videos(
+                                                opt_kw,
+                                                orientation="portrait" if "9:16" in aspect else "landscape"
+                                            )
+                                    if st.button("🔄 Tìm lại Pixabay Video", key=f"search_pix_btn_{idx}"):
                                         with st.spinner("Đang tìm video trên Pixabay..."):
                                             st.session_state[f"pix_vid_{idx}"] = search_pixabay_videos(
                                                 opt_kw,
@@ -4679,7 +5428,13 @@ with tab_main:
                                 opt_kw = optimize_query_for_region(new_kw, new_region)
                                 if opt_kw != new_kw:
                                     st.caption(f"💡 Từ khóa tối ưu vùng miền: `{opt_kw}`")
-                                if st.button("🔎 Tìm Coverr Video", key=f"search_cov_btn_{idx}"):
+                                if st.session_state.get(f"cov_vid_{idx}") is None and opt_kw:
+                                    with st.spinner("🔍 Đang tìm Coverr Video tự động..."):
+                                        st.session_state[f"cov_vid_{idx}"] = search_coverr_videos(
+                                            opt_kw,
+                                            orientation="portrait" if "9:16" in aspect else "landscape"
+                                        )
+                                if st.button("🔄 Tìm lại Coverr Video", key=f"search_cov_btn_{idx}"):
                                     with st.spinner("Đang tìm video trên Coverr..."):
                                         st.session_state[f"cov_vid_{idx}"] = search_coverr_videos(
                                             opt_kw,
@@ -4726,7 +5481,13 @@ with tab_main:
                                     opt_kw = optimize_query_for_region(new_kw, new_region)
                                     if opt_kw != new_kw:
                                         st.caption(f"💡 Từ khóa tối ưu vùng miền: `{opt_kw}`")
-                                    if st.button("🔎 Tìm Pexels Photo", key=f"search_pex_img_btn_{idx}"):
+                                    if st.session_state.get(f"pex_img_{idx}") is None and opt_kw:
+                                        with st.spinner("🔍 Đang tìm Pexels Photo tự động..."):
+                                            st.session_state[f"pex_img_{idx}"] = search_pexels_photos_only(
+                                                opt_kw,
+                                                orientation="portrait" if "9:16" in aspect else "landscape"
+                                            )
+                                    if st.button("🔄 Tìm lại Pexels Photo", key=f"search_pex_img_btn_{idx}"):
                                         with st.spinner("Đang tìm ảnh trên Pexels..."):
                                             st.session_state[f"pex_img_{idx}"] = search_pexels_photos_only(
                                                 opt_kw,
@@ -4772,7 +5533,13 @@ with tab_main:
                                     opt_kw = optimize_query_for_region(new_kw, new_region)
                                     if opt_kw != new_kw:
                                         st.caption(f"💡 Từ khóa tối ưu vùng miền: `{opt_kw}`")
-                                    if st.button("🔎 Tìm Pixabay Photo", key=f"search_pix_img_btn_{idx}"):
+                                    if st.session_state.get(f"pix_img_{idx}") is None and opt_kw:
+                                        with st.spinner("🔍 Đang tìm Pixabay Photo tự động..."):
+                                            st.session_state[f"pix_img_{idx}"] = search_pixabay_photos_only(
+                                                opt_kw,
+                                                orientation="portrait" if "9:16" in aspect else "landscape"
+                                            )
+                                    if st.button("🔄 Tìm lại Pixabay Photo", key=f"search_pix_img_btn_{idx}"):
                                         with st.spinner("Đang tìm ảnh trên Pixabay..."):
                                             st.session_state[f"pix_img_{idx}"] = search_pixabay_photos_only(
                                                 opt_kw,
@@ -4809,11 +5576,13 @@ with tab_main:
                                                         edited = True
                                                         st.rerun()
 
+
                             with tab_upload:
                                 st.markdown("**📤 Tải lên file của bạn (Ghi đè Stock):**")
                                 up_vid = st.file_uploader("Upload Video (mp4, mov):", type=["mp4","mov"], key=f"up_{idx}")
                                 up_img = st.file_uploader("Upload Ảnh (jpg, png, webp):", type=["jpg","jpeg","png","webp"], key=f"up_img_{idx}")
-                                
+
+
                                 effect_labels = {
                                     None: "🎲 Ngẫu nhiên (Không lặp)",
                                     "zoom_in": "🔍 Zoom In (Từ xa lại gần)",
@@ -4861,14 +5630,20 @@ with tab_main:
                                     edited = True
                                     st.rerun()
                                 has_any_video = True
-                            # Video upload
+                            # Video upload / chọn từ máy
                             elif proj["scenes"][idx].get("customVid") and Path(proj["scenes"][idx]["customVid"]).exists():
-                                st.success("🎥 Dùng video tải lên")
+                                st.success("🎥 Dùng video tải lên / từ máy")
+                                _cv_path = proj["scenes"][idx]["customVid"]
+                                try:
+                                    st.video(_cv_path)
+                                except Exception:
+                                    st.caption(f"📄 `{Path(_cv_path).name}`")
                                 if st.button("Xóa video tải lên", key=f"del_{idx}"):
                                     proj["scenes"][idx]["customVid"] = None
                                     edited = True
                                     st.rerun()
                                 has_any_video = True
+
                             elif scene.get("videoUrl"):
                                 st.success("🔗 Đã liên kết Video Stock")
                                 st.video(scene.get("videoUrl"))
@@ -4878,7 +5653,17 @@ with tab_main:
                                     st.rerun()
                                 has_any_video = True
                             else:
-                                st.warning("⚠️ Chưa có nền")
+                                st.warning("⚠️ Chưa chọn nền")
+                                # Gợi ý nhẹ về loại footage mặc định
+                                _use_ai_right = st.session_state.get("use_ai_images_confirm",
+                                               st.session_state.get("use_ai_images_main", True))
+                                _is_mix_photo = (idx > 0) and (idx % 3 == 2) and not _use_ai_right
+                                if _is_mix_photo:
+                                    st.caption("↓ Hoặc để trống → tool tự dùng **ảnh stock** (xen kẽ)")
+                                elif _use_ai_right:
+                                    st.caption("↓ Hoặc để trống → tool tự tạo **AI Image**")
+                                else:
+                                    st.caption("↓ Hoặc để trống → tool tự tìm **video Pexels**")
                                 
                             new_mode = "start"
                             new_start = 0.0
@@ -5040,15 +5825,18 @@ with tab_main:
                 save_proj(proj)
                 st.success("Đã lưu các thay đổi của bạn!")
 
-            if s.get("tags"):
-                st.write(" ".join(f"`#{t}`" for t in s["tags"]))
+
+            _meta = proj.get("script", {}) if isinstance(proj.get("script"), dict) else {}
+            if _meta.get("tags"):
+                st.write(" ".join(f"`#{t}`" for t in _meta["tags"]))
 
             c1, c2 = st.columns(2)
             c1.button("📋 Copy title", on_click=lambda: None)
             if c2.button("📄 Tải metadata"):
-                txt = f"TITLE:\n{s.get('title','')}\n\nDESCRIPTION:\n{s.get('description','')}\n\nTAGS:\n{' '.join('#'+t for t in s.get('tags',[]))}\n\nSCRIPT:\n"
+                txt = f"TITLE:\n{_meta.get('title','')}\n\nDESCRIPTION:\n{_meta.get('description','')}\n\nTAGS:\n{' '.join('#'+t for t in _meta.get('tags',[]))}\n\nSCRIPT:\n"
                 txt += "\n\n".join(f"[Cảnh {i+1}]\n{sc.get('text','')}" for i, sc in enumerate(proj.get("scenes", [])))
                 st.download_button("⬇️ metadata.txt", txt, "youtube_meta.txt", "text/plain")
+
 
         if proj.get("finalPath") and Path(proj["finalPath"]).exists():
             st.divider()
@@ -5334,7 +6122,8 @@ with tab_veo:
                             if "Duration:" in _ln:
                                 _ts = _ln.split("Duration:")[1].split(",")[0].strip()
                                 _hh, _mm, _ss = _ts.split(":")
-                                scenes[i]["duration"] = int(_hh)*3600 + int(_mm)*60 + float(_ss) + 0.3
+                                # Buffer 0.05s để không cắt tiếng — không dùng +0.3s gây dôi thời gian
+                                scenes[i]["duration"] = round(int(_hh)*3600 + int(_mm)*60 + float(_ss) + 0.05, 2)
                                 break
                     except Exception:
                         pass
