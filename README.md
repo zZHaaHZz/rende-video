@@ -16,6 +16,7 @@ Công cụ tạo video AI tự động — từ keyword → video hoàn chỉnh 
 | 🎬 **Render video** | FFmpeg ghép cảnh + voice + phụ đề → MP4 |
 | 📺 **Long-form & Shorts** | Hỗ trợ video dài (main) và video ngắn (Shorts) song song |
 | 🔀 **Chống trùng footage** | Global deduplication + shuffle Pexels/Pixabay kết quả |
+| 🎨 **Creative Studio** | Làm phim ngắn, quảng cáo, UGC, mood film... → prompt Veo 3 → upload clip → tự dựng |
 
 ---
 
@@ -89,6 +90,7 @@ Sau khi chạy app, vào tab **⚙️ Settings** để nhập API keys. Tất c�
 ```
 ai-video-creator/
 ├── tool.py                    # 🎯 App chính (Streamlit)
+├── creative_studio.py         # Module sáng tạo nội dung độc lập + dựng clip Veo 3
 ├── capcut_tts.py              # Module CapCut TTS
 ├── grok_video.py              # Module Grok video generation
 ├── test_srt.py                # Test script cho SRT
@@ -133,6 +135,27 @@ ai-video-creator/
 - **Main**: Video dài (mặc định, lưu vào `.avc_project.json`)
 - **Shorts**: Video ngắn 60s (lưu vào `.avc_project_shorts.json`)
 - Chuyển chế độ bằng nút toggle trong sidebar
+
+### Creative Studio (mảng nội dung sáng tạo)
+
+Creative Studio là workflow độc lập, không dùng project hay state của
+Main/Shorts/Veo3 Studio. Giao diện được chia thành wizard 4 bước:
+
+1. **Ý tưởng:** chọn dạng nội dung, hướng kể chuyện, loại hình video (người
+   thật, hoạt hình 2D/3D, anime, claymation...), phong cách, mood và nhịp dựng.
+2. **Storyboard:** AI tạo creative direction, Character Bible và prompt từng
+   cảnh. Có thể thêm ảnh tham chiếu, chỉnh duration, khóa khung hình đầu/cuối,
+   hướng chuyển động và đổi thứ tự cảnh.
+3. **Sản xuất:** chọn Gemini Web để upload MP4 thủ công hoặc Veo API để tự tạo
+   tất cả cảnh còn thiếu. Mỗi cảnh có sound plan riêng và có thể upload
+   Foley/SFX, chỉnh âm lượng cùng thời điểm bắt đầu.
+4. **Xuất bản:** thêm nhạc, giữ audio gốc, tự động audio-ducking và ghép MP4
+   bằng timeline `xfade/acrossfade` (cut, dissolve, whip, flash, fade, match).
+   Khi hình cần loop để đủ duration, audio gốc chỉ phát một lần rồi pad silence,
+   tránh tiếng click hoặc ambience bị lặp máy móc.
+
+Project được lưu riêng tại `~/.avc_creative_project.json`; clip tại
+`~/.avc_creative_assets/`; video final tại `~/Desktop/AI_Videos/Creative_Studio/`.
 
 ---
 

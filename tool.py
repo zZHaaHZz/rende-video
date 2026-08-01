@@ -3,6 +3,7 @@ AI Video Creator — Python Streamlit App
 Chạy: streamlit run tool.py
 """
 import streamlit as st
+from vietnamese_tts import normalize_vietnamese_tts
 import asyncio, json, os, re, uuid, base64, subprocess, shutil, time, tempfile, random, math
 from typing import Optional
 from pathlib import Path
@@ -10,6 +11,10 @@ import requests
 
 # ── CapCut TTS ────────────────────────────────────────────────────────────────
 try:
+    import sys as _sys
+    if "capcut_tts" in _sys.modules:
+        import importlib as _importlib
+        _importlib.reload(_sys.modules["capcut_tts"])
     import capcut_tts as _cc
     _CAPCUT_OK = _cc.is_available()
 except Exception as _cce:
@@ -23,6 +28,23 @@ try:
 except Exception as _ve:
     _VEO3_OK = False
     print(f"[tool] Veo3 module not loaded: {_ve}")
+
+# ── Standalone Creative Studio ────────────────────────────────────────────────
+try:
+    import creative_studio as _creative
+    # Streamlit reruns tool.py in the same Python process. If creative_studio.py
+    # changed while the app was open, a normal import can return the old module
+    # object whose render function still accepts only three arguments.
+    import importlib as _importlib
+    import inspect as _inspect
+    if "veo_engine" not in _inspect.signature(
+        _creative.render_creative_studio
+    ).parameters:
+        _creative = _importlib.reload(_creative)
+    _CREATIVE_OK = True
+except Exception as _creative_error:
+    _CREATIVE_OK = False
+    print(f"[tool] Creative Studio not loaded: {_creative_error}")
 
 
 st.set_page_config(page_title="AI Video Creator", page_icon="🎬", layout="wide")
@@ -48,6 +70,11 @@ def load_cfg():
         # Veo3 settings
         "veo3_enabled": False,      # Bật/tắt Veo3 generation
         "veo3_mode":    "fallback",  # "all" = mọi scene | "fallback" = chỉ khi stock không có
+        "veo3_provider": "stock",   # "stock" | "gemini_web" | "api" | "google_flow"
+        # Google Flow UseAPI settings
+        "useapi_token": "",
+        "useapi_email": "",
+        "useapi_model": "veo-3.1-fast",
     }
     if CFG_FILE.exists():
         try:
@@ -56,11 +83,41 @@ def load_cfg():
                 if k not in data:
                     data[k] = v
             return data
-        except: pass
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"[config] Cannot read {CFG_FILE}: {exc}")
     return default_cfg
 
+def _atomic_json_write(path: Path, data, *, ensure_ascii=True):
+    """Write JSON without leaving a half-written project after a crash."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with tmp_path.open("w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=ensure_ascii, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
 def save_cfg(cfg):
-    CFG_FILE.write_text(json.dumps(cfg, indent=2))
+    _atomic_json_write(CFG_FILE, cfg)
+    # This file contains API keys; keep it private on POSIX systems.
+    try:
+        CFG_FILE.chmod(0o600)
+    except OSError:
+        pass
+
+def reset_groq_cache():
+    """Reset Groq model cache khi key thay đổi."""
+    global _GROQ_LIVE_MODELS, _GROQ_CACHE_KEY_HASH, _GROQ_BLACKLIST
+    try:
+        _GROQ_LIVE_MODELS = []
+        _GROQ_CACHE_KEY_HASH = ""
+        _GROQ_BLACKLIST = set()
+    except Exception:
+        pass
+
 
 if "cfg" not in st.session_state:
     st.session_state.cfg = load_cfg()
@@ -75,13 +132,15 @@ def get_proj_file():
 def load_proj():
     pf = get_proj_file()
     if pf.exists():
-        try: return json.loads(pf.read_text())
-        except: pass
+        try:
+            return json.loads(pf.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"[project] Cannot read {pf}: {exc}")
     return {"script": None, "scenes": [], "step": 0}
 
 def save_proj(p):
     pf = get_proj_file()
-    pf.write_text(json.dumps(p, ensure_ascii=False, indent=2))
+    _atomic_json_write(pf, p, ensure_ascii=False)
 
 if "proj_mode" not in st.session_state:
     st.session_state.proj_mode = st.session_state.cfg.get("last_proj_mode", "main")
@@ -118,23 +177,34 @@ def call_gemini(key, prompt):
     return d["candidates"][0]["content"]["parts"][0]["text"].replace("```json", "").replace("```", "").strip()
 
 def call_groq_llm(key, prompt):
-    # Models đang hoạt động tốt trên Groq (cập nhật 2025-07)
-    # llama-3.1-70b-versatile ❌ deprecated
-    # deepseek-r1-distill-llama-70b ❌ 400 on most orgs
-    LARGE_MODELS = [
-        "llama-3.3-70b-versatile",       # 70B — tốt nhất, ưu tiên
-        "meta-llama/llama-4-scout-17b-16e-instruct",  # Llama 4 Scout mới
-        "llama3-70b-8192",               # Llama 3 70B legacy (vẫn hoạt động)
-    ]
-    SMALL_MODELS = [
-        "llama-3.1-8b-instant",          # Nhanh, chỉ dùng khi prompt < 6000 chars
-        "gemma2-9b-it",                  # Google Gemma
-        "llama3-8b-8192",               # Llama 3 8B legacy
-    ]
+    global _GROQ_LIVE_MODELS, _GROQ_CACHE_KEY_HASH, _GROQ_BLACKLIST
+    _key_hash = key[-8:] if key else ""
+    if not _GROQ_LIVE_MODELS or _GROQ_CACHE_KEY_HASH != _key_hash:
+        try:
+            _r = requests.get("https://api.groq.com/openai/v1/models",
+                               headers={"Authorization": f"Bearer {key}"}, timeout=5)
+            if _r.ok:
+                _SKIP = ["whisper","guard","vision","orpheus","allam","canopylabs","tts","embed","rerank"]
+                _all = [m["id"] for m in _r.json().get("data",[])
+                        if not any(p in m["id"].lower() for p in _SKIP)]
+                _pri = ["llama-3.3-70b-versatile","llama-3.1-70b-versatile"]
+                _large = [m for m in _all if any(x in m for x in ["70b","70B","compound","maverick"])]
+                _small = [m for m in _all if m not in _large]
+                _ord = [p for p in _pri if p in _all]+[m for m in _large if m not in _pri]+_small
+                _GROQ_LIVE_MODELS = _ord
+                _GROQ_CACHE_KEY_HASH = _key_hash
+                _GROQ_BLACKLIST = set()
+                print(f"[Groq] {len(_GROQ_LIVE_MODELS)} models: {_GROQ_LIVE_MODELS[:4]}")
+        except Exception as _fe:
+            print(f"[Groq] Fetch failed: {_fe}")
+        if not _GROQ_LIVE_MODELS:
+            _GROQ_LIVE_MODELS = ["llama-3.3-70b-versatile","llama-3.1-70b-versatile","llama-3.1-8b-instant"]
+            _GROQ_CACHE_KEY_HASH = _key_hash
 
-    # Với prompt lớn, chỉ dùng large models (tránh 413)
     prompt_chars = len(prompt)
-    models = LARGE_MODELS if prompt_chars > 5000 else (LARGE_MODELS + SMALL_MODELS)
+    models = [m for m in _GROQ_LIVE_MODELS if m not in _GROQ_BLACKLIST]
+    if not models:
+        raise Exception("All Groq models unavailable after retries")
 
     for model in models:
         max_retries = 2
@@ -148,7 +218,7 @@ def call_groq_llm(key, prompt):
                         "model": model,
                         "messages": [{"role": "user", "content": prompt}],
                         "temperature": 0.65,
-                        "max_tokens": 8192,
+                        "max_tokens": 4096,  # TPM safe
                     },
                     timeout=90,
                 )
@@ -164,7 +234,10 @@ def call_groq_llm(key, prompt):
                 print(f"[Groq/{model}] 413 Prompt too large ({prompt_chars} chars) — thử model khác")
                 break
             if r.status_code in (400, 404):
-                print(f"[Groq/{model}] {r.status_code} — model không khả dụng, thử tiếp")
+                _body = r.json() if r.content else {}
+                _emsg = _body.get("error",{}).get("message",f"HTTP {r.status_code}")[:100]
+                print(f"[Groq/{model}] {r.status_code} — {_emsg}")
+                _GROQ_BLACKLIST.add(model)
                 break
             if r.status_code == 429:
                 retry_after = int(r.headers.get("retry-after", backoff))
@@ -541,6 +614,8 @@ EDGE_VOICES = {
     "vi-female": "vi-VN-HoaiMyNeural",
     "ko-KR": "ko-KR-InJoonNeural",   # Male KO
     "ko-female": "ko-KR-SunHiNeural",# Female KO
+    "ja-JP": "ja-JP-KeitaNeural",      # Male JA
+    "ja-female": "ja-JP-NanamiNeural", # Female JA
 }
 
 def tts_edge_with_timing(text, voice_key="en-US", audio_out=None, srt_out=None, rate="1.0"):
@@ -846,23 +921,38 @@ def tts_edge(text, voice_key="en-US", out_path=None):
     audio, _ = tts_edge_with_timing(text, voice_key, out_path)
     return audio
 
-def tts_groq_api(text, voice="Fritz-PlayAI", out_path=None):
-    """Groq TTS — fallback, needs Groq key."""
+def tts_groq_api(text, voice="troy", out_path=None):
+    """Groq Orpheus English TTS fallback (PlayAI was shut down in 2025)."""
     key = (cfg.get("groq") or [None])[0]
     if not key: return None
+    # Orpheus currently supports English/Arabic, not Vietnamese/Korean/Japanese.
+    # The caller only invokes this fallback for an English voice.
     try:
-        r = requests.post(
-            "https://api.groq.com/openai/v1/audio/speech",
-            headers={"Authorization": f"Bearer {key}"},
-            json={"model": "playai-tts", "input": text, "voice": voice, "response_format": "wav"},
-            timeout=60,
-        )
-        if r.ok:
-            out_path = out_path or (AUDIO_DIR / f"{uuid.uuid4().hex}.wav")
-            Path(out_path).write_bytes(r.content)
+        chunks = _split_text_chunks(text, max_chars=190)
+        chunk_paths = []
+        for chunk in chunks:
+            r = requests.post(
+                "https://api.groq.com/openai/v1/audio/speech",
+                headers={"Authorization": f"Bearer {key}"},
+                json={
+                    "model": "canopylabs/orpheus-v1-english",
+                    "input": chunk,
+                    "voice": voice,
+                    "response_format": "wav",
+                },
+                timeout=60,
+            )
+            if not r.ok:
+                print(f"[GroqTTS/Orpheus] HTTP {r.status_code}: {r.text[:200]}")
+                return None
+            chunk_path = AUDIO_DIR / f"{uuid.uuid4().hex}_orpheus.wav"
+            chunk_path.write_bytes(r.content)
+            chunk_paths.append(str(chunk_path))
+        out_path = Path(out_path or (AUDIO_DIR / f"{uuid.uuid4().hex}_orpheus.m4a"))
+        if _concat_audio_chunks(chunk_paths, str(out_path)):
             return str(out_path)
     except Exception as e:
-        print(f"[GroqTTS] {e}")
+        print(f"[GroqTTS/Orpheus] {e}")
     return None
 
 def _split_text_chunks(text: str, max_chars: int = 350) -> list:
@@ -930,14 +1020,20 @@ def _concat_audio_chunks(chunk_paths: list, out_path: str) -> bool:
 _CAPCUT_FAIL_COUNT = 0
 _CAPCUT_SKIP = False   # True = bỏ qua CapCut, dùng Edge TTS thẳng
 
-def tts(text, voice_cfg="en-US", srt_out=None, rate="1.0"):
+def tts(text, voice_cfg="en-US", srt_out=None, rate="1.0",
+        allow_edge_fallback=True):
     """Try CapCut TTS (chunked) → Edge TTS → Groq, return audio path.
     voice_cfg: either a CapCut display key (e.g. '🇻🇳 Cô Gái Hoạt Ngôn (BV074)')
                or a legacy Edge key (e.g. 'en-US', 'vi-VN').
     rate: speed string for CapCut TTS ('0.8'...'1.3').
+    allow_edge_fallback: When False, a selected CapCut voice must succeed as-is.
+                         This prevents silently replacing named voices (for
+                         example "Bản Tin Nữ") with a generic Edge voice.
     CapCut giới hạn ~400 ký tự/request → tự động chunk + nối audio lại.
     """
     global _CAPCUT_FAIL_COUNT, _CAPCUT_SKIP
+    if "🇻🇳" in voice_cfg or voice_cfg in ("vi-VN", "vi-female"):
+        text = normalize_vietnamese_tts(text)
     # ── CapCut TTS (preferred, chunked để tránh bị cắt tiếng) ────────────────
     if _CAPCUT_OK and not _CAPCUT_SKIP and voice_cfg in _cc.CAPCUT_VOICES:
         CAPCUT_MAX_CHARS = 350
@@ -964,7 +1060,8 @@ def tts(text, voice_cfg="en-US", srt_out=None, rate="1.0"):
                 ffmpeg_bin=FFMPEG or "ffmpeg",
             )
             if not audio:
-                print(f"[TTS] CapCut chunk {ci+1}/{len(chunks)} failed → fallback")
+                _next_action = "fallback" if allow_edge_fallback else "giữ nguyên giọng, không fallback"
+                print(f"[TTS] CapCut chunk {ci+1}/{len(chunks)} failed → {_next_action}")
                 chunk_failed = True
                 break
 
@@ -1004,15 +1101,21 @@ def tts(text, voice_cfg="en-US", srt_out=None, rate="1.0"):
                 if srt_out and all_srt_words:
                     srt_content = make_srt(all_srt_words, group=4)
                     Path(srt_out).write_text(srt_content, encoding="utf-8")
+                _CAPCUT_FAIL_COUNT = 0
                 return str(final_audio)
 
         _CAPCUT_FAIL_COUNT += 1
-        if _CAPCUT_FAIL_COUNT >= 4:
+        if allow_edge_fallback and _CAPCUT_FAIL_COUNT >= 4:
             _CAPCUT_SKIP = True
             print(f"[TTS] CapCut failed {_CAPCUT_FAIL_COUNT}x → CIRCUIT BREAKER ON: dùng Edge TTS cho tất cả cảnh còn lại")
-        else:
+        elif allow_edge_fallback:
             print(f"[TTS] CapCut failed ({_CAPCUT_FAIL_COUNT}/4) → fallback Edge TTS lần này, thử lại CapCut cảnh sau")
+        else:
+            print(f"[TTS] CapCut failed ({_CAPCUT_FAIL_COUNT}x) — chế độ giữ nguyên giọng đang bật")
 
+        if not allow_edge_fallback:
+            print(f"[TTS] Giữ nguyên giọng đã chọn '{voice_cfg}' — không tự đổi sang Edge TTS")
+            return None
 
     # ── Edge TTS fallback ─────────────────────────────────────────────────────
     # Detect ngôn ngữ + giới tính từ CapCut voice key display name
@@ -1040,9 +1143,55 @@ def tts(text, voice_cfg="en-US", srt_out=None, rate="1.0"):
     if audio: return audio
 
 
-    # ── Groq TTS last resort ──────────────────────────────────────────────────
-    groq_voice = "Fritz-PlayAI" if "en" in voice_cfg.lower() else "Celeste-PlayAI"
-    return tts_groq_api(text, groq_voice)
+    # ── Groq Orpheus last resort (English only) ───────────────────────────────
+    _looks_english = (
+        voice_cfg in ("en-US", "en-female")
+        or "🇺🇸" in voice_cfg
+        or "english" in voice_cfg.lower()
+        or " en " in f" {voice_cfg.lower()} "
+    )
+    return tts_groq_api(text, "troy") if _looks_english else None
+
+
+def probe_audio_duration(audio_path) -> Optional[float]:
+    """Return a real decodable audio duration, never a text-length estimate."""
+    path = Path(audio_path) if audio_path else None
+    if not path or not path.exists() or path.stat().st_size <= 1000 or not FFMPEG:
+        return None
+    try:
+        probe = subprocess.run(
+            [FFMPEG, "-v", "error", "-i", str(path), "-f", "null", "-"],
+            capture_output=True, text=True,
+        )
+        # With -v error FFmpeg may omit Duration, so use ffprobe when available.
+        ffprobe_bin = str(Path(FFMPEG).with_name("ffprobe"))
+        if not Path(ffprobe_bin).exists():
+            ffprobe_bin = shutil.which("ffprobe")
+        if ffprobe_bin:
+            measured = subprocess.run(
+                [
+                    ffprobe_bin, "-v", "error", "-show_entries", "format=duration",
+                    "-of", "default=noprint_wrappers=1:nokey=1", str(path),
+                ],
+                capture_output=True, text=True,
+            )
+            if measured.returncode == 0:
+                duration = float(measured.stdout.strip())
+                if duration > 0.05:
+                    return duration
+        for line in probe.stderr.splitlines():
+            if "Duration:" in line:
+                ts = line.split("Duration:", 1)[1].split(",", 1)[0].strip()
+                hours, minutes, seconds = ts.split(":")
+                duration = int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+                return duration if duration > 0.05 else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+def is_valid_audio(audio_path) -> bool:
+    return probe_audio_duration(audio_path) is not None
 
 def srt_from_audio(audio_path, text, srt_path, tts_rate="1.0"):
     """Generate SRT from audio. Tries Edge TTS word-boundary timing (scaled to real duration),
@@ -1113,6 +1262,78 @@ def clean_keyword(kw, lang=""):
 
 # Cache dịch keyword để không gọi API lặp lại
 _KW_TRANSLATE_CACHE: dict = {}
+_GROQ_LIVE_MODELS: list = []
+_GROQ_CACHE_KEY_HASH: str = ""
+_GROQ_BLACKLIST: set = set()
+
+VEO3_PROMPT_TEMPLATE = """\
+SUBJECT: {character}
+ACTION: {action}
+ENVIRONMENT: {environment}
+CAMERA: Eye-level cinematic documentary shot, slow smooth push-in, stable natural motion, shallow depth of field.
+LIGHTING: Natural realistic light, soft shadows, balanced colors.
+AUDIO: Ambient location sound only; no narration or spoken dialogue.
+STYLE: Photorealistic, authentic {nationality} setting, believable human behavior, subtle film grain.
+AVOID: Text, subtitles, logos, watermark, distorted anatomy, duplicated people, CGI or cartoon look.\
+"""
+
+def build_veo3_prompt(character: str, action: str, environment: str, nationality: str) -> str:
+    """Single canonical Veo prompt used by API, editor and web export."""
+    fallback_character = f"A realistic {nationality} person with natural appearance"
+    return VEO3_PROMPT_TEMPLATE.format(
+        character=(character or fallback_character).strip(),
+        action=(action or "Natural movement matching the narration, with subtle expressions").strip(),
+        environment=(environment or f"An authentic everyday {nationality} location").strip(),
+        nationality=(nationality or "local").strip(),
+    ).strip()
+
+def build_visual_prompts_batch(scenes: list, lang: str, log_cb=None) -> list:
+    """Generate visual-only fields after narration is final, in economical batches."""
+    nationality = {
+        "Korean": "South Korean",
+        "Vietnamese": "Vietnamese",
+        "Japanese": "Japanese",
+        "English": "Western",
+    }.get(lang, "local")
+
+    for start in range(0, len(scenes), 10):
+        chunk = scenes[start:start + 10]
+        compact_input = [
+            {
+                "id": scene.get("id", start + offset + 1),
+                "narration": scene.get("text", "")[:500],
+                "keyword": scene.get("keyword", ""),
+            }
+            for offset, scene in enumerate(chunk)
+        ]
+        prompt = (
+            "You are a visual director. Convert each narration into one filmable, "
+            "photorealistic documentary shot. Do not rewrite the narration. "
+            "Return ONLY JSON with this schema: "
+            '{"scenes":[{"id":1,"character":"English description",'
+            '"action":"English description","environment":"English description"}]}. '
+            f"People and locations should be authentically {nationality}. "
+            "One subject, one clear action, one location per scene. No text, logos, "
+            "spoken dialogue, brand-name cameras or resolution claims.\n\n"
+            f"INPUT:\n{json.dumps(compact_input, ensure_ascii=False)}"
+        )
+        try:
+            parsed = parse_json_robust(call_ai(prompt))
+            by_id = {str(item.get("id")): item for item in parsed.get("scenes", [])}
+        except Exception as exc:
+            by_id = {}
+            if callable(log_cb):
+                log_cb(f"  ⚠️ Visual prompt batch lỗi: {exc} — dùng prompt local")
+
+        for scene in chunk:
+            visual = by_id.get(str(scene.get("id")), {})
+            scene["veo3_prompt"] = build_veo3_prompt(
+                visual.get("character", f"A realistic {nationality} person"),
+                visual.get("action", "Natural movement matching the scene"),
+                visual.get("environment", scene.get("keyword", f"An authentic {nationality} location")),
+                nationality,
+            )
+    return scenes
 
 def _translate_keyword_to_en(kw: str, lang: str = "") -> str:
     """Dịch keyword VN/KR → EN ngắn gọn (2-4 từ) cho stock search.
@@ -1130,6 +1351,8 @@ def _translate_keyword_to_en(kw: str, lang: str = "") -> str:
         region_hint = " (keep 'Vietnamese'/'Vietnam' in result if describing people, streets, or lifestyle)"
     elif lang == "Korean":
         region_hint = " (keep 'Korean'/'Korea'/'Seoul' in result if describing people, streets, or lifestyle)"
+    elif lang == "Japanese":
+        region_hint = " (keep 'Japanese'/'Japan'/'Tokyo' in result if describing people, streets, or lifestyle)"
 
     prompt = (
         f"Translate this stock video search keyword to concise English (2-4 words max){region_hint}. "
@@ -1644,7 +1867,8 @@ def search_pixabay_videos(keyword, orientation="landscape"):
 
 def fetch_video_with_veo3(keyword: str, orientation: str = "landscape",
                            used_urls=None, scene_text: str = "",
-                           log_cb=None, force_veo3=False) -> str:
+                           log_cb=None, force_veo3=False,
+                           veo3_prompt: str = "") -> str:
     """
     Smart video fetch: Veo3 AI hoặc stock footage tùy theo cấu hình.
 
@@ -1653,32 +1877,75 @@ def fetch_video_with_veo3(keyword: str, orientation: str = "landscape",
         - str bắt đầu bằng "http" → URL stock footage
         - "" nếu thất bại hoàn toàn
     """
-    veo3_on   = (cfg.get("veo3_enabled", False) or force_veo3) and _VEO3_OK
+    veo3_provider = cfg.get("veo3_provider", "stock")
+    veo3_requested = (
+        veo3_provider in ("gemini_web", "google_flow")
+        or cfg.get("veo3_enabled", False)
+        or force_veo3
+    )
+    veo3_on = (
+        veo3_requested
+        and (
+            (veo3_provider == "api" and _VEO3_OK)
+            or (veo3_provider == "google_flow" and bool(cfg.get("useapi_token")))
+        )
+    )
     veo3_mode = "all" if force_veo3 else cfg.get("veo3_mode", "fallback")
     gem_keys  = cfg.get("gemini", [])
 
+    if veo3_requested and veo3_provider == "gemini_web":
+        if callable(log_cb):
+            log_cb("🌐 Gemini Web: bỏ qua API; hãy tạo và nhập MP4 trong editor cảnh")
+        # In fallback mode stock remains useful. In all-scenes mode an empty
+        # result deliberately leaves the scene pending for a web download.
+        if veo3_mode == "all":
+            return ""
+        return fetch_stock_video(keyword, orientation=orientation, used_urls=used_urls) or ""
+
     def _veo3_generate():
-        """Rotate qua tất cả Gemini keys — key nào thành công thì dùng."""
-        if not gem_keys:
-            if callable(log_cb): log_cb("❌ Veo3: chưa có Gemini key trong Settings")
-            return None
-        for ki, api_key in enumerate(gem_keys):
-            if callable(log_cb): log_cb(f"  🔑 Veo3 key {ki+1}/{len(gem_keys)} ({api_key[:8]}...)")
-            result = _veo3.generate_video_veo3_best(
+        """Tạo video qua API (Veo3 SDK/REST hoặc Google Flow UseAPI)."""
+        if veo3_provider == "google_flow":
+            token = cfg.get("useapi_token", "")
+            email = cfg.get("useapi_email", "")
+            model = cfg.get("useapi_model", "veo-3.1-fast")
+            if not token:
+                if callable(log_cb): log_cb("❌ Google Flow: Chưa cấu hình UseAPI Token trong Settings")
+                return None
+            if callable(log_cb): log_cb("🚀 Gọi Google Flow qua UseAPI...")
+            result = _veo3.generate_video_google_flow(
                 keyword         = keyword,
-                gemini_api_key  = api_key,
+                token           = token,
+                email           = email if email else None,
+                model           = model,
                 orientation     = orientation,
                 scene_text      = scene_text,
-                timeout_seconds = 200,
-                resolution      = cfg.get("veo3_resolution", "720p"),
+                timeout_seconds = 240,
                 log_cb          = log_cb,
+                veo3_prompt     = veo3_prompt,
             )
-            if result:
-                if callable(log_cb): log_cb(f"  ✅ Veo3 OK với key {ki+1}")
-                return result
-            if callable(log_cb): log_cb(f"  ⚠️ Key {ki+1} thất bại → thử key tiếp")
-        if callable(log_cb): log_cb("❌ Veo3: tất cả key đều thất bại (quota/permission?) → dùng stock footage")
-        return None
+            return result
+        else:
+            if not gem_keys:
+                if callable(log_cb): log_cb("❌ Veo3: chưa có Gemini key trong Settings")
+                return None
+            for ki, api_key in enumerate(gem_keys):
+                if callable(log_cb): log_cb(f"  🔑 Veo3 key {ki+1}/{len(gem_keys)} ({api_key[:8]}...)")
+                result = _veo3.generate_video_veo3_best(
+                    keyword         = keyword,
+                    gemini_api_key  = api_key,
+                    orientation     = orientation,
+                    scene_text      = scene_text,
+                    timeout_seconds = 200,
+                    resolution      = cfg.get("veo3_resolution", "720p"),
+                    log_cb          = log_cb,
+                    veo3_prompt     = veo3_prompt,
+                )
+                if result:
+                    if callable(log_cb): log_cb(f"  ✅ Veo3 OK với key {ki+1}")
+                    return result
+                if callable(log_cb): log_cb(f"  ⚠️ Key {ki+1} thất bại → thử key tiếp")
+            if callable(log_cb): log_cb("❌ Veo3: tất cả key đều thất bại (quota/permission?) → dùng stock footage")
+            return None
 
     # ── Mode: ALL → Veo3 trước, fallback stock nếu Veo3 fail ──
     if veo3_on and veo3_mode == "all":
@@ -2201,6 +2468,8 @@ def download_url(url, dest):
             if chunk: f.write(chunk)
 
 def ffmpeg(*args):
+    if not FFMPEG:
+        raise RuntimeError("Không tìm thấy FFmpeg. Hãy cài FFmpeg trước khi render.")
     cmd = [FFMPEG, "-y", "-loglevel", "error"] + list(args)
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
@@ -2209,8 +2478,13 @@ def ffmpeg(*args):
 # Check if FFmpeg has subtitles filter (requires libass)
 @st.cache_data
 def has_subtitles_filter():
-    r = subprocess.run([FFMPEG, "-filters"], capture_output=True, text=True)
-    return "subtitles" in r.stdout
+    if not FFMPEG:
+        return False
+    try:
+        r = subprocess.run([FFMPEG, "-filters"], capture_output=True, text=True)
+        return r.returncode == 0 and "subtitles" in r.stdout
+    except OSError:
+        return False
 
 HAS_SUB = has_subtitles_filter()
 
@@ -2270,7 +2544,9 @@ hr {
 </style>
 """, unsafe_allow_html=True)
 
-tab_main, tab_veo, tab_settings = st.tabs(["🎬 Pipeline", "🤖 Veo3 Studio", "⚙️ Settings"])
+tab_main, tab_veo, tab_creative, tab_settings = st.tabs(
+    ["🎬 Pipeline", "🤖 Veo3 Studio", "🎨 Creative Studio", "⚙️ Settings"]
+)
 
 # ════════════════════════════════════════════════════════════
 # SETTINGS TAB
@@ -2291,11 +2567,11 @@ with tab_settings:
     st.subheader("⚡ Groq Keys (LLM + TTS)")
     new_q = st.text_input("Thêm Groq key", placeholder="gsk_...", type="password", key="q_in")
     if st.button("➕ Thêm Groq") and new_q.strip():
-        cfg.setdefault("groq", []).append(new_q.strip()); changed = True
+        cfg.setdefault("groq", []).append(new_q.strip()); changed = True; reset_groq_cache()
     for i, k in enumerate(cfg.get("groq", [])):
         c1, c2 = st.columns([5,1])
         c1.code(k[:8] + "..." + k[-4:])
-        if c2.button("✕", key=f"dq{i}"): cfg["groq"].pop(i); changed = True
+        if c2.button("✕", key=f"dq{i}"): cfg["groq"].pop(i); changed = True; reset_groq_cache()
 
     st.subheader("🎥 Pexels Keys (footage CC0)")
     new_p = st.text_input("Thêm Pexels key", placeholder="Pexels API key...", type="password", key="p_in")
@@ -2338,24 +2614,75 @@ with tab_settings:
         "⚠️ Mỗi video mất ~60–120s và tiêu tốn quota. Dùng chế độ **Fallback** nếu chưa chắc."
     )
 
-    _veo3_enabled = st.toggle(
-        "🔴 Bật Veo3 Video Generation",
-        value=cfg.get("veo3_enabled", False),
-        key="veo3_toggle",
-        help="Khi bật: mỗi scene trong kịch bản sẽ được generate video bằng Veo3 AI"
+    _veo3_provider = st.radio(
+        "🔌 Nguồn tạo video",
+        options=["stock", "gemini_web", "api", "google_flow"],
+        format_func=lambda value: {
+            "stock": "Stock/ảnh — không tạo Veo, không tốn credit",
+            "gemini_web": "Gemini Web — KHÔNG gọi API, dùng gói Pro/Ultra",
+            "api": "Veo API — tự động hoàn toàn, CÓ dùng API credit",
+            "google_flow": "Google Flow (UseAPI) — tạo video tự động qua UseAPI.net",
+        }[value],
+        index=["stock", "gemini_web", "api", "google_flow"].index(cfg.get("veo3_provider", "stock")),
+        horizontal=True,
+        key="veo3_provider_radio",
     )
-    if _veo3_enabled != cfg.get("veo3_enabled", False):
-        cfg["veo3_enabled"] = _veo3_enabled
+    if _veo3_provider != cfg.get("veo3_provider", "stock"):
+        cfg["veo3_provider"] = _veo3_provider
         changed = True
 
-    if _veo3_enabled:
+    if _veo3_provider == "api":
+        _veo3_enabled = st.toggle(
+            "💳 Bật Veo API (sẽ tiêu tốn API credit)",
+            value=cfg.get("veo3_enabled", False),
+            key="veo3_toggle",
+            help="Chỉ bật nếu bạn chấp nhận sử dụng credit của Gemini/Veo API",
+        )
+        if _veo3_enabled != cfg.get("veo3_enabled", False):
+            cfg["veo3_enabled"] = _veo3_enabled
+            changed = True
+    elif _veo3_provider == "google_flow":
+        _veo3_enabled = True
+        if not cfg.get("veo3_enabled", False):
+            cfg["veo3_enabled"] = True
+            changed = True
+    else:
+        _veo3_enabled = False
+        if cfg.get("veo3_enabled", False):
+            cfg["veo3_enabled"] = False
+            changed = True
+
+    if _veo3_enabled or _veo3_provider == "gemini_web":
+
+        if _veo3_provider == "google_flow":
+            st.write("🔧 **Cấu hình Google Flow (UseAPI.net)**")
+            useapi_tok = st.text_input("UseAPI.net API Token", value=cfg.get("useapi_token", ""), type="password", key="useapi_token_in", help="Lấy token tại api.useapi.net")
+            if useapi_tok != cfg.get("useapi_token", ""):
+                cfg["useapi_token"] = useapi_tok
+                changed = True
+                
+            useapi_em = st.text_input("Google Flow Email (optional)", value=cfg.get("useapi_email", ""), placeholder="your_email@gmail.com", key="useapi_email_in", help="Email của account Google Flow. Để trống để tự động chọn account.")
+            if useapi_em != cfg.get("useapi_email", ""):
+                cfg["useapi_email"] = useapi_em
+                changed = True
+                
+            useapi_mod = st.selectbox("Model", options=["veo-3.1-fast", "veo-3.1-quality", "veo-3.1-lite", "omni-flash"], index=["veo-3.1-fast", "veo-3.1-quality", "veo-3.1-lite", "omni-flash"].index(cfg.get("useapi_model", "veo-3.1-fast")), key="useapi_model_in")
+            if useapi_mod != cfg.get("useapi_model", "veo-3.1-fast"):
+                cfg["useapi_model"] = useapi_mod
+                changed = True
+
         _veo3_mode = st.radio(
-            "🎯 Chế độ Veo3",
+            "🎯 Chế độ Veo3/Flow",
             options=["fallback", "all"],
-            format_func=lambda x: {
-                "fallback": "🔄 Fallback — Chỉ dùng Veo3 khi Pexels/Pixabay không có kết quả phù hợp",
-                "all":      "✨ All Scenes — Mọi scene đều dùng Veo3 (chất lượng cao nhất, tốn quota)",
-            }.get(x, x),
+            format_func=lambda x: (
+                {
+                    "fallback": "🔄 Stock trước — chỉ chuẩn bị prompt khi thiếu footage",
+                    "all": "🌐 All Scenes — chờ video sinh từ AI, không dùng Stock",
+                } if _veo3_provider in ("gemini_web", "google_flow") else {
+                    "fallback": "🔄 Fallback — chỉ gọi Veo API khi stock không có",
+                    "all": "💳 All Scenes — mọi cảnh gọi Veo API và dùng credit",
+                }
+            ).get(x, x),
             index=0 if cfg.get("veo3_mode", "fallback") == "fallback" else 1,
             key="veo3_mode_radio",
             horizontal=True,
@@ -2364,21 +2691,35 @@ with tab_settings:
             cfg["veo3_mode"] = _veo3_mode
             changed = True
 
-        # Resolution
-        _veo3_res = st.radio(
-            "🖥️ Resolution",
-            options=["720p", "1080p", "4k"],
-            index=["720p", "1080p", "4k"].index(cfg.get("veo3_resolution", "720p")),
-            key="veo3_res_radio",
-            horizontal=True,
-            help="720p = nhanh hơn, tốn ít quota | 1080p/4k = chất lượng cao hơn, chậm hơn",
-        )
-        if _veo3_res != cfg.get("veo3_resolution", "720p"):
-            cfg["veo3_resolution"] = _veo3_res
-            changed = True
+        # Resolution (chỉ dùng cho api chính thức)
+        if _veo3_provider != "google_flow":
+            _veo3_res = st.radio(
+                "🖥️ Resolution",
+                options=["720p", "1080p", "4k"],
+                index=["720p", "1080p", "4k"].index(cfg.get("veo3_resolution", "720p")),
+                key="veo3_res_radio",
+                horizontal=True,
+                help="720p = nhanh hơn, tốn ít quota | 1080p/4k = chất lượng cao hơn, chậm hơn",
+            )
+            if _veo3_res != cfg.get("veo3_resolution", "720p"):
+                cfg["veo3_resolution"] = _veo3_res
+                changed = True
+
+        if _veo3_provider == "gemini_web":
+            st.info(
+                "Gemini Web sẽ không gọi Veo API. App chuẩn bị prompt; bạn mở Gemini, "
+                "tạo video, tải MP4 và nhập lại ngay trong editor từng cảnh."
+            )
 
         _gem_keys = cfg.get("gemini", [])
-        if _gem_keys:
+        if _veo3_provider == "gemini_web":
+            st.success("✅ Không cần Veo API key; dùng phiên đăng nhập Gemini trên trình duyệt.")
+        elif _veo3_provider == "google_flow":
+            if cfg.get("useapi_token"):
+                st.success("✅ Sẵn sàng: Đã cấu hình UseAPI Token cho Google Flow.")
+            else:
+                st.error("❌ Chưa cấu hình UseAPI Token! Hãy điền token để sử dụng.")
+        elif _gem_keys:
             st.success(f"✅ Sẵn sàng: {len(_gem_keys)} Gemini key(s) sẽ được thử lần lượt cho Veo3")
         else:
             st.error("❌ Chưa có Gemini key! Thêm Gemini key bên trên để dùng Veo3.")
@@ -2539,20 +2880,73 @@ with tab_main:
                 help="Hiệu ứng mờ dần (Fade) có thể làm video bị đen khoảng 0.5s ở giữa các cảnh. Khuyên dùng: Tắt (cắt cảnh nhanh sẽ cuốn hút hơn)."
             )
 
-        lang = st.selectbox("🌍 Ngôn ngữ", ["English", "Vietnamese", "Korean"])
+        _saved_lang = proj.get("lang", "Vietnamese" if new_mode in ("shorts", "veo3") else "English")
+        _lang_opts = ["English", "Vietnamese", "Korean", "Japanese"]
+        _lang_idx = _lang_opts.index(_saved_lang) if _saved_lang in _lang_opts else 0
+        lang = st.selectbox("🌍 Ngôn ngữ", _lang_opts, index=_lang_idx)
+        if lang != proj.get("lang"):
+            proj["lang"] = lang
+            save_proj(proj)
 
         # ── Voice selector: CapCut voices if available, else Edge fallback ───
-        if _CAPCUT_OK:
-            _lang_flag = {"Vietnamese": "🇻🇳", "English": "🇺🇸", "Korean": "🇰🇷"}.get(lang, "🇺🇸")
-            _lang_code  = {"Vietnamese": "vi", "English": "en", "Korean": "ko"}.get(lang, "en")
+        if lang == "Korean":
+            # Voice.json hiện không có giọng CapCut Hàn hợp lệ. Các ID BV700–
+            # BV706 cũ trả TTSInvalidText, nên Korean luôn dùng Edge Neural.
+            _ko_voice_opts = [
+                "ko-KR (SunHi - Female)",
+                "ko-KR (InJoon - Male)",
+            ]
+            _ko_saved = proj.get("voice_cfg_key")
+            _ko_default = "ko-KR (SunHi - Female)"
+            if _ko_saved == "ko-KR":
+                _ko_default = "ko-KR (InJoon - Male)"
+            voice = st.selectbox(
+                "🔊 Giọng đọc tiếng Hàn (Edge TTS)",
+                _ko_voice_opts,
+                index=_ko_voice_opts.index(_ko_default),
+                key="voice_edge_ko",
+            )
+            voice_cfg_key = {
+                "ko-KR (SunHi - Female)": "ko-female",
+                "ko-KR (InJoon - Male)": "ko-KR",
+            }[voice]
+            if voice_cfg_key != proj.get("voice_cfg_key"):
+                proj["voice_cfg_key"] = voice_cfg_key
+                save_proj(proj)
+
+            _valid_rates = ["0.8", "0.9", "1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.6", "1.7", "1.8", "2.0"]
+            _default_rate = st.session_state.get("tts_rate_slider") or cfg.get("tts_rate", "1.3")
+            if _default_rate not in _valid_rates:
+                _default_rate = "1.3"
+            tts_rate = st.select_slider(
+                "⚡ Tốc độ đọc",
+                options=_valid_rates,
+                value=_default_rate,
+                key="tts_rate_slider",
+            )
+            if tts_rate != cfg.get("tts_rate"):
+                cfg["tts_rate"] = tts_rate
+                save_cfg(cfg)
+            _force_edge = True
+            _allow_voice_fallback = True
+            st.info("✅ Tiếng Hàn dùng Edge Neural ổn định; không gửi tới ID CapCut Hàn bị lỗi.")
+        elif _CAPCUT_OK:
+            _lang_flag = {"Vietnamese": "🇻🇳", "English": "🇺🇸", "Korean": "🇰🇷", "Japanese": "🇯🇵"}.get(lang, "🇺🇸")
+            _lang_code  = {"Vietnamese": "vi", "English": "en", "Korean": "ko", "Japanese": "ja"}.get(lang, "en")
             _voice_opts = [k for k in _cc.CAPCUT_VOICES if _lang_flag in k]
-            _default_voice = _cc.CAPCUT_VOICE_DEFAULTS.get(_lang_code, _voice_opts[0])
+
+            # Khôi phục giọng đọc đã lưu nếu hợp lệ cho ngôn ngữ hiện tại
+            _saved_voice = proj.get("voice_cfg_key")
+            _default_voice = _saved_voice if _saved_voice in _voice_opts else _cc.CAPCUT_VOICE_DEFAULTS.get(_lang_code, _voice_opts[0])
             _default_idx   = _voice_opts.index(_default_voice) if _default_voice in _voice_opts else 0
+
             voice = st.selectbox(
                 "🔊 Giọng đọc (CapCut)",
                 _voice_opts,
                 index=_default_idx,
-                key="voice_capcut_sel",
+                # Mỗi ngôn ngữ có state riêng; tránh đổi Vietnamese ↔ Korean
+                # nhưng Streamlit vẫn giữ giọng của ngôn ngữ trước.
+                key=f"voice_capcut_sel_{_lang_code}",
                 help="Giọng CapCut AI chất lượng cao — không cần Edge TTS hay Groq"
             )
             # Rate slider — Shorts nên dùng 1.3-1.6x để dồn nhiều nội dung
@@ -2574,7 +2968,12 @@ with tab_main:
             if tts_rate != cfg.get("tts_rate"):
                 cfg["tts_rate"] = tts_rate
                 save_cfg(cfg)
+
             voice_cfg_key = voice  # CapCut key is passed directly
+            if voice_cfg_key != proj.get("voice_cfg_key"):
+                proj["voice_cfg_key"] = voice_cfg_key
+                save_proj(proj)
+
             # Checkbox force Edge TTS — dùng khi CapCut bị stuck/timeout
             _force_edge = st.checkbox(
                 "⚡ Bỏ CapCut → dùng Edge TTS thẳng (nhanh hơn, không bị stuck)",
@@ -2582,6 +2981,18 @@ with tab_main:
                 key="force_edge_tts",
                 help="Bật khi CapCut TTS bị treo hoặc chậm. Edge TTS miễn phí, không cần poll."
             )
+            if lang == "Vietnamese":
+                # Một video Việt phải dùng đúng một engine/voice từ đầu đến cuối.
+                # Fallback theo từng cảnh là nguyên nhân tạo đoạn nam/nữ/English lẫn nhau.
+                _allow_voice_fallback = False
+                st.caption("🔒 Khóa giọng Việt: CapCut lỗi sẽ dừng, không tự đổi voice ở riêng một cảnh.")
+            else:
+                _allow_voice_fallback = st.checkbox(
+                    "Cho phép tự đổi sang giọng dự phòng khi CapCut lỗi",
+                    value=False,
+                    key="allow_voice_fallback",
+                    help="Tắt để giữ đúng một giọng xuyên suốt video.",
+                )
             if _force_edge:
                 import sys as _sys2
                 _mm2 = _sys2.modules.get("__main__") or _sys2.modules.get("tool")
@@ -2592,12 +3003,12 @@ with tab_main:
 
         else:
             st.warning("⚠️ CapCut TTS chưa sẵn sàng — dùng Edge TTS fallback")
-            voice = st.selectbox("🔊 Giọng đọc", [
+            _edge_opts = [
                 "en-US (Guy - Male)", "en-US (Jenny - Female)",
                 "vi-VN (NamMinh)", "vi-VN (HoaiMy - Female)",
                 "ko-KR (InJoon - Male)", "ko-KR (SunHi - Female)",
-            ])
-            tts_rate = "1.0"
+                "ja-JP (Keita - Male)", "ja-JP (Nanami - Female)",
+            ]
             _legacy_map = {
                 "en-US (Guy - Male)": "en-US",
                 "en-US (Jenny - Female)": "en-female",
@@ -2605,8 +3016,25 @@ with tab_main:
                 "vi-VN (HoaiMy - Female)": "vi-female",
                 "ko-KR (InJoon - Male)": "ko-KR",
                 "ko-KR (SunHi - Female)": "ko-female",
+                "ja-JP (Keita - Male)": "ja-JP",
+                "ja-JP (Nanami - Female)": "ja-female",
             }
+            # Tìm kiếm giọng lưu từ project để đặt làm default
+            _saved_voice = proj.get("voice_cfg_key")
+            _default_edge_idx = 0
+            if _saved_voice:
+                for _k, _v in _legacy_map.items():
+                    if _v == _saved_voice:
+                        _default_edge_idx = _edge_opts.index(_k)
+                        break
+            voice = st.selectbox("🔊 Giọng đọc", _edge_opts, index=_default_edge_idx)
+            tts_rate = "1.0"
             voice_cfg_key = _legacy_map.get(voice, "en-US")
+            if voice_cfg_key != proj.get("voice_cfg_key"):
+                proj["voice_cfg_key"] = voice_cfg_key
+                save_proj(proj)
+            _force_edge = True
+            _allow_voice_fallback = True
 
         # Khôi phục aspect đã chọn trước đó; fallback theo mode nếu chưa có
         _saved_aspect = proj.get("aspect", "")
@@ -2709,6 +3137,14 @@ with tab_main:
                 f"3. NO STUTTERING: NEVER repeat a word consecutively.\n"
                 f"   FORBIDDEN: '이를 이를', '그래서 그래서', 'của của', 'và và', 'the the'.\n"
                 f"4. TONE: Aggressive, street-smart TikTok financial analyst. Punchy, NOT academic/robotic.\n\n"
+                + (
+                    "5. VIETNAMESE TTS TEXT: In every text field, spell out ALL numbers, "
+                    "percentages and English terms exactly as natural Vietnamese speech. "
+                    "Write 'chín mươi lăm phần trăm', never '95%'; write "
+                    "'a phi li ét', 'tíc tốc shop', never 'Affiliate', 'TikTok Shop'.\n\n"
+                    if lang == "Vietnamese" else ""
+                )
+                +
                 f"=== HOOK (SCENE 1) ===\n"
                 f"Style: {hook_style}\n"
                 f"MUST trigger immediate emotion (shock/fear/curiosity) in max 1.5 seconds.\n"
@@ -2718,6 +3154,10 @@ with tab_main:
                 f"FORBIDDEN: 'Follow for more', '팔로우해주세요', 'Follow để biết thêm'.\n\n"
                 f"=== ANTI-REPETITION ===\n"
                 f"Each scene = 1 completely NEW idea. NEVER reuse the same concept across scenes.\n\n"
+                f"=== VISUAL DESCRIPTION ===\n"
+                f"For each scene, add one concise English veo3_prompt (80–160 words). "
+                f"Describe subject, action and environment first, followed by camera, lighting, ambient audio and a short avoid list. "
+                f"No brand-name cameras, fake resolution claims, narration or dialogue.\n\n"
                 f"=== RETURN FORMAT (ONLY valid JSON — no markdown, no explanation) ===\n"
                 f'{{\n'
                 f'  "title": "viral title in {lang} (max 60 chars)",\n'
@@ -2728,12 +3168,15 @@ with tab_main:
                 f'      "id": 1,\n'
                 f'      "text": "narration in {lang} — exactly {_wpsc} words",\n'
                 f'      "keyword": {_kw_ex},\n'
-                f'      "veo3_prompt": "[Tiếng Việt] Mô tả cảnh quay: chủ thể, hành động, bối cảnh, góc máy, ánh sáng",\n'
+                f'      "duration": {target_sec_per_scene},\n'
+                f'      "veo3_prompt": "Concise English visual prompt following the canonical format",\n'
                 f'      "retention_note": "why viewer stays"\n'
                 f'    }}\n'
                 f'  ]\n'
                 f'}}\n\n'
-                f"Write EXACTLY {_ep_sc} scenes (id 1 to {_ep_sc}). Each narration ~{_wpsc} words. Return ONLY the JSON."
+                f"Write EXACTLY {_ep_sc} scenes (id 1 to {_ep_sc}). Each narration ~{_wpsc} words.\n"
+                f"Set \"duration\" = reading time in seconds (word_count / {round(_wps, 1):.1f} wps, min 3s, max {round(target_sec_per_scene * 1.5):.0f}s).\n"
+                f"Return ONLY the JSON."
             )
 
         # ── 2 nút chính: Tự động | Thủ công ────────────────────────────────
@@ -2806,13 +3249,22 @@ with tab_main:
                                 "scenes":      _imp_scenes,
                             }
                             # ── Pre-populate proj["scenes"] để edit UI hoạt động ngay ──
-                            _wps_map_imp = {"Vietnamese": 3.8, "Korean": 2.2, "English": 2.2}
+                            _wps_map_imp = {"Vietnamese": 3.8, "Korean": 2.2, "English": 2.2, "Japanese": 2.0}
                             _wps_imp = _wps_map_imp.get(lang, 2.2) * float(tts_rate)
                             _tgt_imp = float(target_sec_per_scene)
                             _imp_built_scenes = []
                             for _ii, _sc in enumerate(_imp_scenes):
                                 _txt = _sc.get("text", "")
-                                _dur = round(max(_tgt_imp, len(_txt.split()) / max(_wps_imp, 0.1) + 0.4), 1)
+                                _json_dur = _sc.get("duration")
+                                if _json_dur and isinstance(_json_dur, (int, float)) and 3 <= float(_json_dur) <= 60:
+                                    _dur = round(float(_json_dur), 1)
+                                else:
+                                    _is_korean = lang in ("Korean", "Japanese")
+                                    if _is_korean or not any("A" <= c <= "z" for c in _txt[:20]):
+                                        _dur_raw = max(len(_txt.replace(" ",""))/3.0, len(_txt.split())/max(_wps_imp,0.1))
+                                    else:
+                                        _dur_raw = len(_txt.split()) / max(_wps_imp, 0.1)
+                                    _dur = round(min(max(_dur_raw + 0.4, 3.0), _tgt_imp * 1.5), 1)
                                 _imp_built_scenes.append({
                                     "id":          _sc.get("id", _ii + 1),
                                     "text":        _txt,
@@ -2832,6 +3284,12 @@ with tab_main:
                             st.session_state.proj["scenes"] = _imp_built_scenes
                             st.session_state.proj["lang"]   = lang
                             st.session_state.proj["target_sec_per_scene"] = _tgt_imp
+                            _pid = st.session_state.proj.get("id", "")
+                            for _ci in range(len(_imp_built_scenes) + 5):
+                                _dk = f"auto_vid_done_{_pid}{_ci}"
+                                if _dk in st.session_state: del st.session_state[_dk]
+                                for _k in list(st.session_state.keys()):
+                                    if _k.startswith(f"kw_trans_{_ci}_"): del st.session_state[_k]
                             save_proj(st.session_state.proj)
                             if "_gpt_export_prompt" in st.session_state:
                                 del st.session_state["_gpt_export_prompt"]
@@ -3075,8 +3533,9 @@ with tab_main:
                 topic = niche + " (short-form, independent)"
             is_shorts_mode = (new_mode == "shorts")
 
-            voice_id = "Fritz-PlayAI" if "Fritz" in voice else "Celeste-PlayAI"
-            work = TMP / uuid.uuid4().hex
+            # Work dir cố định theo proj mode → cache scene.mp4 giữa các lần render
+            _proj_mode_slug = st.session_state.get("proj_mode", "main")
+            work = TMP / f"proj_{_proj_mode_slug}"
             work.mkdir(exist_ok=True)
 
             try:
@@ -3111,6 +3570,13 @@ with tab_main:
                             ("street-smart mentor",      "Bạn là người có 10 năm kinh nghiệm thực chiến. Nói thẳng, không vòng vo, ví dụ từ cuộc sống hàng ngày người Việt."),
                             ("contrarian thinker",       "Bạn phản biện quan điểm chủ lưu. Bắt đầu bằng cách lật ngược điều mọi người tưởng là đúng, rồi giải thích tại sao."),
                         ],
+                        "Japanese": [
+                            ("investigative journalist", "あなたは日本の経済調査記者です。隠された真実を暴くように書いてください。緊迫感があり、具体的なデータを使い、政策への批判的な視点を持ちます。"),
+                            ("empathetic advisor",       "あなたは35歳のファイナンシャルアドバイザーで、同じ失敗を経験してきました。友人に打ち明けるように書き、'私たち'を使ってください。"),
+                            ("data analyst",             "あなたはデータアナリストです。具体的な衝撃的な数字から始めてください。各シーン＝1つの正確な統計＋平易な言葉での解説。"),
+                            ("street-smart mentor",      "あなたは10年先を行く友人です。無駄なく、専門用語なし。日常生活の実例を使います。"),
+                            ("contrarian thinker",       "あなたは常に通説に異を唱えます。人々の思い込みを覆すことから始め、なぜ逆なのかを証明します。"),
+                        ],
                         "English": [
                             ("investigative journalist", "You're an investigative financial journalist exposing what mainstream media won't cover. Urgent, data-driven, with a critical eye on policy."),
                             ("empathetic advisor",       "You're a 35-year-old financial advisor who made every mistake first. Write like you're confiding in a friend, use 'we' instead of 'you'."),
@@ -3127,10 +3593,10 @@ with tab_main:
                     # Words per second by language (actual TTS playback speed):
                     # Vietnamese Edge TTS reads very fast (~3.8 wps)
                     # Korean/English ~2.2 wps
-                    _wps_map = {"Vietnamese": 3.8, "Korean": 2.2, "English": 2.2}
+                    _wps_map = {"Vietnamese": 3.8, "Korean": 2.2, "English": 2.2, "Japanese": 2.0}
                     words_per_sec    = _wps_map.get(lang, 2.2) * rate_val
                     # Minimum words per scene varies by language (Vietnamese needs more to fill time)
-                    _min_words_map   = {"Vietnamese": 35, "Korean": 18, "English": 18}
+                    _min_words_map   = {"Vietnamese": 35, "Korean": 18, "English": 18, "Japanese": 16}
                     min_words_scene  = _min_words_map.get(lang, 18)
                     total_words      = max(40, round((duration + 2) * words_per_sec))
                     words_per_scene  = max(min_words_scene, round(target_sec_per_scene * words_per_sec))
@@ -3315,6 +3781,14 @@ with tab_main:
                         )
                         kw_example = '"elderly Korean man walking park"'
                         kw_bad = '"aging population", "Korean society", "Korea trend"'
+                    elif lang == 'Japanese':
+                        lang_style_instruction = (
+                            "For scenes involving people/streets/lifestyle, prefer keywords with 'Japanese', 'Japan', or 'Tokyo'. "
+                            "NEVER use 'Korean', 'Korea', 'Vietnam' unless the scene is literally about those countries. "
+                            "For universal topics (nature, science, data), use generic English visuals."
+                        )
+                        kw_example = '"young Japanese woman looking at phone Tokyo"'
+                        kw_bad = '"society", "Asian street", "concept", "Korea street"'
                     elif lang == 'Vietnamese':
                         lang_style_instruction = (
                             "For scenes with people/streets/lifestyle, prefer keywords with 'Vietnamese', 'Vietnam', 'Hanoi', or 'Ho Chi Minh'. "
@@ -3445,6 +3919,10 @@ with tab_main:
                                f"  → Ví dụ đúng: 'Cảnh quay gần mặt người đại lý bất động sản người Hàn đang giải thích cho cặp vợ chồng trẻ người Hàn'\n"
                                f"  → Ví dụ SAI: 'người đàn ông trẻ' (không rõ quốc tịch)\n"
                                if lang == "Korean" else
+                               "'người Nhật Bản' hoặc 'người Tokyo'.\n"
+                               f"  → Ví dụ đúng: 'Cảnh quay gần người đàn ông trẻ Nhật đang nhìn hóa đơn thuê nhà với vẻ lo lắng tại Tokyo'\n"
+                               f"  → Ví dụ SAI: 'người đàn ông trẻ' (không rõ quốc tịch)\n"
+                               if lang == "Japanese" else
                                "'người Việt Nam'.\n"
                                f"  → Ví dụ đúng: 'Cảnh quay gần cô gái trẻ người Việt đang nhìn bảng giá căn hộ với vẻ lo lắng'\n"
                                f"  → Ví dụ SAI: 'người phụ nữ trẻ' (không rõ quốc tịch)\n"
@@ -3456,6 +3934,8 @@ with tab_main:
                         + f"  Ví dụ mẫu ({lang}): "
                         + ("'Cảnh quay gần mặt người đàn ông Hàn Quốc trung niên đang xem hợp đồng thuê nhà với vẻ lo lắng, ánh đèn vàng văn phòng, nền mờ, slow-motion, 4K cinematic.'\n"
                            if lang == "Korean" else
+                           "'Cảnh quay gần người đàn ông trẻ Nhật Bản đang nhìn hóa đơn thuê nhà tại căn hộ nhỏ Tokyo với vẻ lo lắng, ánh đèn vàng ấm, nền mờ, slow-motion, 4K cinematic.'\n"
+                           if lang == "Japanese" else
                            "'Cảnh quay gần cô gái người Việt đang nhìn bảng giá căn hộ tại trung tâm thành phố, ánh sáng buổi chiều, nền mờ đường phố Sài Gòn, slow-motion, chất lượng 4K.'\n"
                            if lang == "Vietnamese" else
                            "'Close-up of a young Western man reviewing a rental contract with a worried expression, warm office light, blurred background, slow-motion, 4K cinematic.'\n"
@@ -3506,6 +3986,7 @@ with tab_main:
                         lang_rule = (
                             "Write in natural Korean (해요체)." if lang == "Korean"
                             else "Write in natural Vietnamese (tiếng Việt)." if lang == "Vietnamese"
+                            else "Write in natural Japanese (です・ます調 or spoken 〜だよね・〜じゃん style)." if lang == "Japanese"
                             else "Write in clear, engaging English."
                         )
 
@@ -3545,6 +4026,10 @@ with tab_main:
                                 "   TUYỆT ĐỐI CẤM: 'của của', 'và và', 'trong trong', 'này này' — mỗi từ chỉ xuất hiện 1 lần.\n"
                                 "4. TONE: Nhà phân tích tài chính TikTok thật thà, đanh thép. Dùng: 'đó', 'nhé', 'thật ra', 'mà',\n"
                                 "   'chứ', 'á', 'vậy đó'. KHÔNG dùng văn mẫu: 'hãy cùng tìm hiểu', 'đây là điều quan trọng'.\n"
+                                "5. VĂN BẢN CHO GIỌNG ĐỌC: Trong mọi trường text, PHẢI viết số, phần trăm và từ tiếng Anh\n"
+                                "   thành cách đọc tiếng Việt. Viết 'chín mươi lăm phần trăm', KHÔNG viết '95%'.\n"
+                                "   Viết 'a phi li ét', 'tíc tốc shop', KHÔNG viết 'Affiliate', 'TikTok Shop'.\n"
+                                "   Dùng câu ngắn và dấu phẩy chủ động để tạo nhịp; không nối từ thừa sau phần trăm.\n"
                                 "\n"
                                 "=== HOOK & CTA RULES (VIETNAMESE-SPECIFIC) ===\n"
                                 "- SCENE 1 (HOOK): Phải là Tuyên bố gây sốc hoặc Câu hỏi kích thích. Tối đa 1.5 giây.\n"
@@ -3610,9 +4095,138 @@ with tab_main:
                                 "  ✅ CORRECT: '월세파? 전세파? 댓글에서 싸워봐요.'\n"
                                 "  NEVER use generic '팔로우해주세요' or '좋아요 눌러주세요'.\n"
                                 "\n"
+                                "=== SENTENCE ENDING DIVERSITY — '~어요/~아요 LULLABY' BAN (CRITICAL) ===\n"
+                                "❌ ABSOLUTE BAN: Using '~어요' or '~아요' as the ending for MORE THAN 2 consecutive sentences.\n"
+                                "   Real Korean TikTokers ROTATE their sentence endings constantly. Repeating the same ending 10+ times = 'lullaby effect' = viewers fall asleep and swipe away by second 20.\n"
+                                "   RULE: After ANY 2 sentences ending in ~어요/~아요, the NEXT sentence MUST use a DIFFERENT ending:\n"
+                                "   ✅ MANDATORY ROTATION — use these alternatives after every 2nd ~어요:\n"
+                                "     ~잖아요  → '비싸잖아요' (conversational, 'you know it is')\n"
+                                "     ~거든요  → '이게 문제거든요' (explanatory, 'the thing is')\n"
+                                "     ~죠?    → '당연하죠?' (rhetorical check-in, 'right?')\n"
+                                "     ~는데요  → '근데 여기가 반전인데요' (twist pivot)\n"
+                                "     ~다는 거! → '두 배가 됐다는 거!' (exclamation punch)\n"
+                                "     ~대요   → '정부가 규제한다대요' (hearsay = sounds natural)\n"
+                                "     ~더라고요 → '실제로 해보니까 달랐더라고요' (experience-based)\n"
+                                "   ❌ BANNED PATTERN: ...있어요. ...해요. ...있어요. ...해요. (monotone loop)\n"
+                                "   ✅ CORRECT PATTERN: ...있어요. ...거든요. ...죠? ...다는 거! (varied, alive)\n"
+                                "\n"
+                                "=== SHORTS LENGTH — '1 VIDEO, 1 THÔNG ĐIỆP' RULE (CRITICAL) ===\n"
+                                "❌ FATAL ERROR: Cramming multiple macro-economic concepts into one Shorts video.\n"
+                                "   Example of VIOLATION (what killed the view count): Writing ONE script covering ALL of:\n"
+                                "   '공급 부족 → 저금리 → 갭투자 → 가계부채 → 청년 포기 → 정책 실패 → 일본 잃어버린 10년'\n"
+                                "   That is 7 separate video topics — not one Shorts script. Viewers feel 'overwhelmed' and swipe at second 20-30.\n"
+                                "   GOLDEN RULE: ONE Shorts video = ONE single, shocking, specific message. THAT'S IT.\n"
+                                "   ✅ CORRECT SCOPE: 'Only about 갭투자 and household debt — nothing else'\n"
+                                "   ✅ CORRECT SCOPE: 'Only the comparison between Seoul bubble and Japan 1990 — nothing else'\n"
+                                "   ✅ CORRECT SCOPE: 'Only about young Koreans giving up on homeownership — nothing else'\n"
+                                "   → If your topic is big, SHRINK the scope to ONE angle. Trust viewers to watch part 2.\n"
+                                "   TARGET DURATION: For Shorts, the ENTIRE script MUST be deliverable in 35–45 seconds.\n"
+                                "   If your script reads longer than 45 seconds at normal TTS speed → YOU HAVE TOO MANY CONCEPTS → DELETE until one remains.\n"
+                                "\n"
                                 "=== ANTI-REPETITION (STRICT — KOREAN) ===\n"
                                 "Each scene MUST introduce completely NEW information.\n"
                                 "Do NOT repeat the same concept (e.g., '수요와 공급의 불균형') across multiple scenes.\n"
+                                "If Scene 2 mentions a concept, Scene 3 MUST cover something different (e.g., interest rates, taxes, policy).\n"
+                                "\n"
+                                "=== STRUCTURAL REPETITION BAN — '당신의 [X]는요?' PATTERN ===\n"
+                                "❌ ABSOLUTELY FORBIDDEN: Using the rhetorical structure '당신의 [X]는요?' (or '~는요?' tagging a noun) MORE THAN ONCE across the entire script.\n"
+                                "   This pattern (e.g., '예산은요?', '계약서는요?', '월급은요?', '보증금은요?') becomes INSTANTLY RECOGNIZABLE as AI-written after the 2nd use — viewers swipe away.\n"
+                                "   RULE: If you use '~는요?' in ONE scene, ALL other scenes MUST use a COMPLETELY DIFFERENT sentence structure to express the same rhetorical contrast.\n"
+                                "   ✅ ALTERNATIVES to '당신의 X는요?':\n"
+                                "     - State the contrast directly: '근데 임금 인상률은 고작 2%잖아요.'\n"
+                                "     - Use a sarcastic observation: '회사는 돈 버는데 직원 지갑은 그대로예요.'\n"
+                                "     - Use an exclamation: '정작 세입자 손에 남는 건 없다는 거!'\n"
+                                "     - Pivot with '그러면': '그러면 대출이자는 누가 내죠?'\n"
+                                "\n"
+                                "=== '당신' USAGE — NATURAL KOREAN RULE ===\n"
+                                "❌ MINIMIZE '당신': Real Korean speakers almost NEVER say '당신' in everyday speech — it sounds like translated English ('you'). Overusing it = AI tell.\n"
+                                "   RULE: Use '당신' MAX 1 time per entire script, ONLY in a high-impact line where it creates deliberate personal confrontation.\n"
+                                "   ✅ INSTEAD of '당신', use these natural Korean alternatives:\n"
+                                "     - Drop the subject entirely: '월급은 오를 생각이 없죠.' (not '당신의 월급은요?')\n"
+                                "     - Use '여러분': '여러분 계좌에 남는 게 얼마예요?' (warmer, plural, natural)\n"
+                                "     - Use implicit 2nd person via situation: '지금 월세 내고 나면 통장 잔고 보이죠?'\n"
+                                "     - Use question without pronoun: '보증금은 돌려받을 수 있을까요?'\n"
+                                "\n"
+                                "=== NUMBER / STATISTIC CONSISTENCY — CRITICAL ===\n"
+                                "❌ FORBIDDEN: Using DIFFERENT numbers for the SAME statistic in different scenes.\n"
+                                "   Example of VIOLATION (destroys credibility instantly):\n"
+                                "     Scene 1: '전세값이 50% 올랐어요.' → Scene 6: '20% 올랐다는 거 알고 계셨나요?' — CONTRADICTORY!\n"
+                                "   RULE: If you introduce a specific number (%, price, year) in Scene X, that EXACT number MUST be used consistently in ALL scenes that reference the same fact.\n"
+                                "   RULE: If you are unsure of the exact figure, pick ONE plausible number and LOCK IT for the entire script. DO NOT vary it.\n"
+                                "   ✅ SAFE APPROACH: Before writing Scene 2+, mentally list all numbers used so far and treat them as FIXED constraints.\n"
+                                "   ✅ FORMAT: Use specific Korean number phrasing: '50% 이상', '두 배', '3조 원' — pick ONE phrasing and reuse the SAME phrasing if the same stat recurs."
+                            )
+                        elif lang == "Japanese":
+                            speech_rules = (
+                                "JAPANESE SPEECH STYLE — PERSONA: 街の金融専門家 / ファイナンス Vlogger (CRITICAL):\n"
+                                "\n"
+                                "=== 必須使用 — SPOKEN JAPANESE ENDINGS (最低2個/scene) ===\n"
+                                "~じゃないですか → '高すぎじゃないですか' (That's too expensive, right?)\n"
+                                "~ですよね?    → 'おかしいですよね?' (That's strange, isn't it?)\n"
+                                "~んですよ     → 'これが核心なんですよ' (This is the key point, you see)\n"
+                                "~わけです     → 'そういうわけです' (That's how it is)\n"
+                                "~って話です   → 'リスクがあるって話です' (The thing is, there's a risk)\n"
+                                "~んですけど   → 'ここで反転があるんですけど' (But here's the twist)\n"
+                                "\n"
+                                "=== リズムブレーカー — RHYTHM WORDS (2〜3 sceneに1個) ===\n"
+                                "'はあ...', '正直ね', 'ちょっと待って', 'これ笑えないですよ', 'でもね', 'ここが面白くて'\n"
+                                "\n"
+                                "=== ABSOLUTE BANS ===\n"
+                                "❌ '皆さんも〜しなければなりません' (You all must...)\n"
+                                "❌ '単純な問題ではありません' (It's not a simple issue)\n"
+                                "❌ '重要なことは' / '大切なポイントは' — clichéd openers\n"
+                                "❌ Any formal/written-style endings (〜であります、〜でございます) in narration\n"
+                                "❌ Any sentence that could apply to ANY topic without changing words\n"
+                                "\n"
+                                "=== LANGUAGE PURITY — HARD RULE (VIOLATIONS = OUTPUT REJECTED) ===\n"
+                                "✅ 100% 純粋な日本語 (Japanese: Hiragana + Katakana + Kanji mix) only.\n"
+                                "✅ Economic terms ALLOWED in English ONLY: OECD, GDP, FED, IMF, ROI, ETF\n"
+                                "❌ STRICTLY FORBIDDEN: Any Korean Hangul characters\n"
+                                "❌ STRICTLY FORBIDDEN: Any Vietnamese or other non-Japanese text\n"
+                                "❌ STRICTLY FORBIDDEN: Mixing Chinese Simplified characters NOT used in standard Japanese\n"
+                                "→ Use standard Japanese kanji only (e.g., '住宅', '賃料', '収入' — all standard JA kanji).\n"
+                                "\n"
+                                "=== JAPANESE LANGUAGE & GRAMMAR PURITY (CRITICAL — HARD RULES) ===\n"
+                                "1. TARGET LANGUAGE: 100% natural, native Japanese. Zero mixing.\n"
+                                "2. NO HALLUCINATION: Ensure correct Japanese grammar. Do NOT invent non-existent words.\n"
+                                "   (e.g., use '高騰している' NOT '高騰してる中'; use '分かる' NOT '分る').\n"
+                                "3. NO STUTTERING: Do NOT repeat any word consecutively by accident.\n"
+                                "   ABSOLUTELY FORBIDDEN: 'で、で、', 'この、この、', 'と、と、' — each word ONCE only.\n"
+                                "4. TONE: Aggressive, street-smart financial analyst on Japanese TikTok. Use informal/polite punchy endings\n"
+                                "   (~じゃないですか, ~ですよね, ~んですよ). DO NOT use stiff formal endings like '〜でございます'.\n"
+                                "\n"
+                                "=== HOOK & CTA RULES (JAPANESE-SPECIFIC) ===\n"
+                                "- SCENE 1 (HOOK): Must be a Shocking Claim or Agitating Question. Max 1.5 seconds of speech.\n"
+                                "  NO generic openers like '多くの人が疑問に思っています' or '今日は〜について話します'.\n"
+                                "  ✅ CORRECT: '東京の家賃、5年で40%上がったじゃないですか。でも給料は?'\n"
+                                "  ✅ CORRECT: '今、あなたの敷金で大家がローンを払ってるかもしれません。'\n"
+                                "- SCENE END (CTA): The final scene MUST end with a provocative question driving comments.\n"
+                                "  ✅ CORRECT: '賃貸派? 購入派? コメントで教えてください!'\n"
+                                "  ✅ CORRECT: '今の手取りで5年後に家を買えると思いますか? 正直に教えて。'\n"
+                                "  NEVER use generic 'フォローしてください' or 'いいね押してください'.\n"
+                                "\n"
+                                "=== '貴方(あなた)' USAGE — NATURAL JAPANESE RULE ===\n"
+                                "❌ MINIMIZE 'あなた': Real Japanese TikTokers rarely address viewers directly as 'あなた' — it sounds stiff.\n"
+                                "   RULE: Use 'あなた' MAX 1 time per script, only for high-impact direct confrontation.\n"
+                                "   ✅ INSTEAD use:\n"
+                                "     - Drop the subject: '手取りが増えない理由、分かりますか?' (no pronoun)\n"
+                                "     - Use '皆さん': '皆さんは知らないかもしれないけど' (warmer, natural)\n"
+                                "     - Use situation-based 2nd person: '毎月赤字になってませんか?'\n"
+                                "\n"
+                                "=== STRUCTURAL REPETITION BAN ===\n"
+                                "❌ FORBIDDEN: Using the same question structure '〇〇はどうですか?' or '〇〇はどうでしょう?' more than ONCE.\n"
+                                "   RULE: Each rhetorical question must use a DIFFERENT grammatical structure.\n"
+                                "   ✅ ALTERNATIVES: 〜ですよね? / 〜じゃないですか / 〜って思いませんか / 〜気がしませんか\n"
+                                "\n"
+                                "=== NUMBER / STATISTIC CONSISTENCY — CRITICAL ===\n"
+                                "❌ FORBIDDEN: Using DIFFERENT numbers for the SAME statistic in different scenes.\n"
+                                "   Example of VIOLATION: Scene 1: '家賃が50%上がった' → Scene 6: '20%上がった' — CONTRADICTORY!\n"
+                                "   RULE: Once you introduce a number (%, price, year), LOCK IT for the entire script.\n"
+                                "   ✅ FORMAT: '40%以上', '2倍', '300万円' — pick ONE phrasing and keep it consistent.\n"
+                                "\n"
+                                "=== ANTI-REPETITION (STRICT — JAPANESE) ===\n"
+                                "Each scene MUST introduce completely NEW information.\n"
+                                "Do NOT repeat the same concept (e.g., '需要と供給のアンバランス') across multiple scenes.\n"
                                 "If Scene 2 mentions a concept, Scene 3 MUST cover something different (e.g., interest rates, taxes, policy)."
                             )
                         else:
@@ -3749,7 +4363,7 @@ with tab_main:
                             format_str = (
                                 f'{{"title":"viral title in {lang} (max 60 chars, curiosity-driven)","description":"SEO description in {lang}",'\
                                 f'"tags":["t1","t2"],"scenes":[{{"id":1,"text":"narration STRICTLY in {lang}",'\
-                                f'"keyword":{kw_example},"veo3_prompt":"[Tiếng Việt] Mô tả cảnh quay rõ ràng: chủ thể, hành động, bối cảnh, góc máy, cảm xúc, ánh sáng (không dùng từ nhạy cảm)","retention_note":"why viewer stays"}}]}}'
+                                f'"keyword":{kw_example},"retention_note":"why viewer stays"}}]}}'
                             )
                         else:
                             end_note = ("FINAL BATCH — close all loops, deliver the payoff, apply CTA." if is_last else "Keep 1 open loop at the end to pull viewer to the next scene.")
@@ -3763,7 +4377,7 @@ with tab_main:
                             )
                             format_str = (
                                 f'{{"scenes":[{{"id":{batch_start},"text":"narration STRICTLY in {lang}",'\
-                                f'"keyword":{kw_example},"veo3_prompt":"[Tiếng Việt] Mô tả cảnh quay rõ ràng: chủ thể, hành động, bối cảnh, góc máy, cảm xúc, ánh sáng (không dùng từ nhạy cảm)","retention_note":"why viewer stays"}}]}}'
+                                f'"keyword":{kw_example},"retention_note":"why viewer stays"}}]}}'
                             )
 
                         if lang == "Vietnamese":
@@ -3776,8 +4390,14 @@ with tab_main:
                             q_banned_1 = "'정책이란 무엇인가요? 정부는 무엇을 할까요? 지금부터 알아봅시다.'"
                             q_banned_2 = "'Let\\'s find out', '알아봅시다', '살펴봅시다'"
                             q_banned_3 = "'오늘은 ~에 대해 알아보겠습니다' / '이 주제에 대해 생각해보신 적 있나요?'"
-                            q_correct_1 = "'2023년 전세 사기 피해액은 3조 원을 넘었습니다. 당신의 보증금도 안전하지 않습니다.'"
+                            q_correct_1 = "'2023년 전세 사기 피해액은 3조 원을 넘었잖아요. 보증금이 그냥 증발하는 거예요.'"
                             q_correct_2 = "'집값이 오를 때 정부는 세금을 올립니다. 그러나 실제로 집주인이 아닌 세입자가 그 비용을 냅니다.'"
+                        elif lang == "Japanese":
+                            q_banned_1 = "'政策とは何でしょうか? 政府は何をしているのでしょうか? 今日は一緒に考えましょう。'"
+                            q_banned_2 = "'見てみましょう', '一緒に学びましょう', '確認してみましょう'"
+                            q_banned_3 = "'今日は〜について話します' / 'このテーマについて考えたことはありますか?'"
+                            q_correct_1 = "'2023年、家賃詐欺の被害額が300億円を超えたんですよ。敷金が消えちゃうって話です。'"
+                            q_correct_2 = "'家賃が上がると政府は税金を上げます。でも実際に払うのは大家じゃなくて入居者なんですよ。'"
                         else:
                             q_banned_1 = "'What is a policy? What does the government do? Let\\'s find out.'"
                             q_banned_2 = "'Let\\'s find out', 'let\\'s explore', 'let\\'s dive in'"
@@ -3857,10 +4477,16 @@ with tab_main:
                             f"2. Does every scene have exactly 1 depth signal (number/mechanism)?\n"
                             f"3. Did you avoid ending any scene with a generic question?\n"
                             f"4. Does scene N naturally transition to scene N+1?\n"
-                            f"5. Did you maintain the same Creator Voice Persona as the introduction?\n\n"
-                            f"Return ONLY valid JSON (no markdown, no explanation, no trailing commas, escape all double quotes inside text fields, no line breaks inside string values):\n{format_str}"
+                            f"5. Did you maintain the same Creator Voice Persona as the introduction?\n"
+                            + (
+                                f"6. [SHORTS ENDING DIVERSITY] Count consecutive sentences ending with ~ì°ì©/~ìì©. "
+                                f"If ANY 3 or more consecutive endings are the same, REWRITE using ~ììì©, ~ê°ëì©, ~ì£ ?, ~ëë°ì©, ~ë¤ë ê±°!, ~ëì© before returning.\n"
+                                f"7. [SHORTS SCOPE] Does this script cover MORE THAN ONE macro concept? "
+                                f"If yes, DELETE all but the single strongest concept. ONE video = ONE message. Target: 35-45 seconds total.\n"
+                                if is_shorts else ""
+                            )
+                            + f"\nReturn ONLY valid JSON (no markdown, no explanation, no trailing commas, escape all double quotes inside text fields, no line breaks inside string values):\n{format_str}"
                         )
-
                         raw_batch = call_ai_script(batch_prompt)
 
                         try:
@@ -3963,6 +4589,25 @@ with tab_main:
                     all_scene_data = _dedup_similar_endings(all_scene_data)
                     log(f"  🧹 Dedup endings: kiểm tra {len(all_scene_data)} cảnh (câu kết trùng sẽ bị xóa tự động)")
 
+                    # Narration and visuals are separate concerns. Generate visual
+                    # prompts only after the final narration is known, and only
+                    # spend an extra AI call when Veo generation is actually on.
+                    if cfg.get("veo3_enabled", False) or cfg.get("veo3_provider") == "gemini_web" or new_mode == "veo3":
+                        log("  🎬 Đang tạo visual prompt theo batch (tối đa 10 cảnh/call)...")
+                        all_scene_data = build_visual_prompts_batch(all_scene_data, lang, log)
+                    else:
+                        _nationality = {
+                            "Korean": "South Korean", "Vietnamese": "Vietnamese",
+                            "Japanese": "Japanese", "English": "Western",
+                        }.get(lang, "local")
+                        for _scene in all_scene_data:
+                            _scene["veo3_prompt"] = build_veo3_prompt(
+                                f"A realistic {_nationality} person",
+                                "Natural movement matching the narration",
+                                _scene.get("keyword", f"An authentic {_nationality} location"),
+                                _nationality,
+                            )
+
                     # ── Fallback: nếu AI batch 1 không trả title/desc/tags → gọi riêng ──
                     if not video_title.strip() or not video_description.strip() or not video_tags:
                         log("  ⚠️ Title/Description/Tags chưa có — đang gọi AI tạo SEO riêng...")
@@ -4000,6 +4645,12 @@ with tab_main:
                             video_description = video_description or ""
                             video_tags = video_tags or []
 
+                    if lang == "Vietnamese":
+                        for scene_data in all_scene_data:
+                            scene_data["text"] = normalize_vietnamese_tts(
+                                str(scene_data.get("text", ""))
+                            )
+
                     script = {
                         "title":       video_title,
                         "description": video_description,
@@ -4033,6 +4684,7 @@ with tab_main:
                                 orientation=vid_orientation,
                                 used_urls=used_pexels_urls,
                                 scene_text=sc_data.get("text", ""),
+                                veo3_prompt=sc_data.get("veo3_prompt", ""),
                                 log_cb=log,
                                 force_veo3=(new_mode == "veo3")
                             )
@@ -4097,9 +4749,13 @@ with tab_main:
                         _words_per_sec = _wps_map.get(lang, 2.2) * float(tts_rate)
 
                         for sc_data in script["scenes"]:
+                            _scene_text = str(sc_data.get("text", ""))
+                            if lang == "Vietnamese":
+                                _scene_text = normalize_vietnamese_tts(_scene_text)
+                                sc_data["text"] = _scene_text
                             scenes.append({
                                 "id":          sc_data.get("id", len(scenes) + 1),
-                                "text":        sc_data.get("text", ""),
+                                "text":        _scene_text,
                                 "keyword":     sc_data.get("keyword", niche),
                                 "veo3_prompt": sc_data.get("veo3_prompt", ""),
                                 "videoUrl":    None,
@@ -4109,7 +4765,7 @@ with tab_main:
                                 "targetDur":   float(target_sec_per_scene),
                                 "duration":    round(
                                     max(float(target_sec_per_scene),
-                                        len(sc_data.get("text", "").split()) / max(_words_per_sec, 0.1) + 0.4),
+                                        len(_scene_text.split()) / max(_words_per_sec, 0.1) + 0.4),
                                     1
                                 ),
                             })
@@ -4182,6 +4838,7 @@ with tab_main:
                                 orientation=vid_orientation,
                                 used_urls=used_urls_step2,
                                 scene_text=s.get("text", ""),
+                                veo3_prompt=s.get("veo3_prompt", ""),
                                 log_cb=log,
                                 force_veo3=(st.session_state.get("proj_mode") == "veo3")
                             )
@@ -4204,115 +4861,129 @@ with tab_main:
                 # Chạy TTS cho cả run_all và run_render (render-only cũng cần audio/SRT mới)
                 if run_all or run_render:
                     # ── Reset circuit breaker mỗi lần chạy mới ──────────────────────────────
-                    # Tránh lỗi session cũ khiến _CAPCUT_SKIP = True vĩnh viễn → im lặng
+                    # Giữ đúng lựa chọn force Edge của người dùng thay vì luôn
+                    # bật lại CapCut khi bắt đầu render.
                     # Dùng globals() để truy cập đúng module scope (Streamlit chạy as __main__)
                     import sys as _sys
                     _main_mod = _sys.modules.get("__main__") or _sys.modules.get("tool")
                     if _main_mod:
                         _main_mod._CAPCUT_FAIL_COUNT = 0
-                        _main_mod._CAPCUT_SKIP = False
+                        _main_mod._CAPCUT_SKIP = bool(_force_edge)
                     else:
                         globals()["_CAPCUT_FAIL_COUNT"] = 0
-                        globals()["_CAPCUT_SKIP"] = False
-                    _tts_label = "CapCut TTS" if (_CAPCUT_OK and voice_cfg_key in _cc.CAPCUT_VOICES) else "Edge TTS"
-                    log(f"🎤 TTS: [{_tts_label}] Giọng='{voice_cfg_key}' | Tốc độ={tts_rate}x")
+                        globals()["_CAPCUT_SKIP"] = bool(_force_edge)
+                    _tts_label = (
+                        "CapCut TTS"
+                        if (_CAPCUT_OK and not _force_edge and voice_cfg_key in _cc.CAPCUT_VOICES)
+                        else "Edge TTS"
+                    )
+                    log(f"🎤 TTS: [{_tts_label}] Ngôn ngữ={lang} | Giọng='{voice_cfg_key}' | Tốc độ={tts_rate}x")
                     log(f"   ℹ️ Hash sẽ thay đổi nếu giọng/tốc độ khác lần trước → auto regenerate")
+                    _consecutive_tts_failures = 0
+                    _tts_batch_aborted = False
+                    _tts_abort_scene = None
                     for i, s in enumerate(scenes):
                         log(f"  TTS cảnh {i+1}/{len(scenes)}")
                         import hashlib
-                        hash_str = s['text'] + voice_cfg_key + str(tts_rate)
+                        # v2 invalidates files previously cached under a CapCut
+                        # voice name even though their actual audio came from Edge.
+                        tts_text = (
+                            normalize_vietnamese_tts(s["text"])
+                            if lang == "Vietnamese" else s["text"]
+                        )
+                        hash_str = (
+                            f"tts-cache-v3|{tts_text}|{voice_cfg_key}|{tts_rate}|"
+                            f"force-edge={bool(_force_edge)}|fallback={bool(_allow_voice_fallback)}"
+                        )
                         h = hashlib.md5(hash_str.encode()).hexdigest()[:12]
                         audio_path = AUDIO_DIR / f"s{h}.mp3"
                         srt_path   = AUDIO_DIR / f"s{h}.srt"
                         actual_dur = None
+                        tts_succeeded = False
 
-                        if audio_path.exists() and audio_path.stat().st_size > 1000:
+                        # Never reuse scene metadata from different text/voice/rate.
+                        if s.get("audioCacheKey") not in (None, h):
+                            scenes[i].pop("audioFile", None)
+                            scenes[i].pop("srtFile", None)
+                            scenes[i].pop("audioDur", None)
+                        scenes[i]["audioCacheKey"] = h
+
+                        # Rate limits commonly begin after 5-6 sequential calls.
+                        if i > 0 and i % 5 == 0 and not is_valid_audio(audio_path):
+                            log("  ⏸️ Cooldown TTS 10s sau mỗi 5 cảnh...")
+                            time.sleep(10)
+                        if _consecutive_tts_failures >= 2:
+                            log("  ⏸️ Hai cảnh lỗi liên tiếp — cooldown provider 20s...")
+                            time.sleep(20)
+
+                        if is_valid_audio(audio_path):
                             log(f"  ♻️ Cache audio cảnh {i+1} — probe duration...")
-                            # Vẫn phải probe để cập nhật duration theo audio-driven logic mới
-                            try:
-                                probe_c = subprocess.run(
-                                    [FFMPEG, "-i", str(audio_path), "-f", "null", "-"],
-                                    capture_output=True, text=True
-                                )
-                                for line in probe_c.stderr.split("\n"):
-                                    if "Duration:" in line:
-                                        ts = line.split("Duration:")[1].split(",")[0].strip()
-                                        hc, mc, secc = ts.split(":")
-                                        actual_dur = int(hc)*3600 + int(mc)*60 + float(secc)
-                                        break
-                            except Exception:
-                                pass
+                            actual_dur = probe_audio_duration(audio_path)
+                            tts_succeeded = actual_dur is not None
                             if show_sub and (not srt_path.exists() or srt_path.stat().st_size == 0):
                                 actual_dur = srt_from_audio(audio_path, s["text"], srt_path)
                         else:
-                            result = tts(s["text"], voice_cfg_key,
+                            audio_path.unlink(missing_ok=True)
+                            srt_path.unlink(missing_ok=True)
+                            result = tts(tts_text, voice_cfg_key,
                                          srt_out=str(srt_path) if show_sub else None,
-                                         rate=tts_rate)
-                            if result:
+                                         rate=tts_rate,
+                                         allow_edge_fallback=_allow_voice_fallback)
+                            if result and is_valid_audio(result):
                                 # Sleep đủ lâu để tránh ExceededConcurrentLimit ở cảnh 5+
                                 if not _CAPCUT_SKIP:
                                     time.sleep(3)  # tăng từ 1s → 3s để CapCut không timeout
                                 shutil.copy(result, audio_path)
-                                # Probe duration thực tế sau copy — quan trọng để actual_dur chính xác
-                                try:
-                                    _p = subprocess.run(
-                                        [FFMPEG, "-i", str(audio_path), "-f", "null", "-"],
-                                        capture_output=True, text=True
-                                    )
-                                    for _ln in _p.stderr.split("\n"):
-                                        if "Duration:" in _ln:
-                                            _ts = _ln.split("Duration:")[1].split(",")[0].strip()
-                                            _hh, _mm, _ss = _ts.split(":")
-                                            actual_dur = int(_hh)*3600 + int(_mm)*60 + float(_ss)
-                                            break
-                                except Exception:
-                                    pass
+                                actual_dur = probe_audio_duration(audio_path)
+                                tts_succeeded = actual_dur is not None
                                 if show_sub and srt_path.exists() and srt_path.stat().st_size == 0:
                                     actual_dur = srt_from_audio(audio_path, s["text"], srt_path)
-                            else:
-                                # TTS thất bại → retry 1 lần với Edge TTS fallback trực tiếp
-                                log(f"  ⚠️ TTS cảnh {i+1} thất bại, retry Edge TTS...")
-                                time.sleep(2)
-                                edge_key = "vi-female" if lang == "Vietnamese" else ("ko-female" if lang == "Korean" else "en-US")
+                            elif _allow_voice_fallback:
+                                # Give Edge's throttle window time to recover.
+                                log(f"  ⚠️ TTS cảnh {i+1} thất bại, cooldown 12s rồi retry Edge TTS...")
+                                time.sleep(12)
+                                edge_key = "vi-female" if lang == "Vietnamese" else ("ko-female" if lang == "Korean" else ("ja-female" if lang == "Japanese" else "en-US"))
                                 edge_audio = AUDIO_DIR / f"{uuid.uuid4().hex}_edge.mp3"
                                 retry_result, _ = tts_edge_with_timing(
                                     s["text"], edge_key, edge_audio,
                                     str(srt_path) if show_sub else None,
                                     rate=tts_rate
                                 )
-                                if retry_result:
+                                if retry_result and is_valid_audio(retry_result):
                                     shutil.copy(retry_result, audio_path)
-                                    # Probe duration sau retry
-                                    try:
-                                        _p2 = subprocess.run(
-                                            [FFMPEG, "-i", str(audio_path), "-f", "null", "-"],
-                                            capture_output=True, text=True
-                                        )
-                                        for _ln2 in _p2.stderr.split("\n"):
-                                            if "Duration:" in _ln2:
-                                                _ts2 = _ln2.split("Duration:")[1].split(",")[0].strip()
-                                                _hh2, _mm2, _ss2 = _ts2.split(":")
-                                                actual_dur = int(_hh2)*3600 + int(_mm2)*60 + float(_ss2)
-                                                break
-                                    except Exception:
-                                        pass
-                                    log(f"  ✅ Retry Edge TTS cảnh {i+1} thành công ({actual_dur:.1f}s)")
+                                    actual_dur = probe_audio_duration(audio_path)
+                                    tts_succeeded = actual_dur is not None
+                                    _duration_label = f"{actual_dur:.1f}s" if actual_dur is not None else "chưa đo được duration"
+                                    log(f"  ✅ Retry Edge TTS cảnh {i+1} thành công ({_duration_label})")
                                 else:
-                                    log(f"  ❌ CẢNH {i+1}: CẢ CapCut + Edge TTS đều THẤT BẠI — cảnh này sẽ KHÔNG có tiếng!")
+                                    log(f"  ❌ CẢNH {i+1}: tất cả provider TTS đều thất bại — cảnh này sẽ dùng silence!")
                                     log(f"     → Nguyên nhân có thể: rate limit CapCut, asyncio conflict, hoặc mất mạng")
-                                    log(f"     → Thử: đợi vài phút rồi chạy lại / bỏ tick 'Giữ cache audio' để force regenerate")
-
-
-
-
+                                    log(f"     → Chạy Render lại: cảnh đã thành công dùng cache, chỉ cảnh lỗi được tạo lại")
+                            else:
+                                log(
+                                    f"  ❌ CẢNH {i+1}: giọng '{voice_cfg_key}' không tạo được. "
+                                    "Không đổi sang Hoài My vì tùy chọn giọng dự phòng đang tắt."
+                                )
+                                log("     → Chờ một lúc rồi Render lại; các cảnh đã thành công vẫn dùng cache.")
                         # ── Update audio duration + path + srtFile cho scene ──
-                        aud_dur = actual_dur if (actual_dur and actual_dur > 0) else max(3.0, len(s["text"].split()) / 3.5)
-                        scenes[i]["audioDur"] = aud_dur
-                        # Chỉ save audioFile nếu file thực sự tồn tại (tránh STEP 4 dùng silence)
-                        if audio_path.exists() and audio_path.stat().st_size > 1000:
+                        estimated_dur = max(3.0, len(s["text"].split()) / 3.5)
+                        aud_dur = actual_dur if tts_succeeded else estimated_dur
+                        if tts_succeeded and is_valid_audio(audio_path):
+                            scenes[i]["audioDur"] = actual_dur
                             scenes[i]["audioFile"] = str(audio_path)
+                            scenes[i]["ttsStatus"] = "ready"
+                            scenes[i].pop("ttsError", None)
+                            _consecutive_tts_failures = 0
                         else:
-                            log(f"  ❌ TTS cảnh {i+1} THẤT BẠI hoàn toàn — CapCut + Edge đều lỗi! Video sẽ không có giọng đọc.")
+                            audio_path.unlink(missing_ok=True)
+                            srt_path.unlink(missing_ok=True)
+                            scenes[i].pop("audioFile", None)
+                            scenes[i].pop("audioDur", None)
+                            scenes[i].pop("srtFile", None)
+                            scenes[i]["ttsStatus"] = "error"
+                            scenes[i]["ttsError"] = "Không provider TTS nào trả về audio hợp lệ"
+                            _consecutive_tts_failures += 1
+                            log(f"  ❌ TTS cảnh {i+1} THẤT BẠI hoàn toàn — video sẽ dùng silence, không dùng nhầm audio cũ.")
                         # Preserve srtFile: chỉ cập nhật khi có file mới, giữ lại nếu đã có từ lần trước
                         if srt_path.exists() and srt_path.stat().st_size > 0:
                             scenes[i]["srtFile"] = str(srt_path)
@@ -4329,9 +5000,39 @@ with tab_main:
                             # Audio dài hơn target: dùng audio duration thực tế (không cắt giọng đọc)
                             final_dur = max(1.5, round(aud_dur + AUDIO_PADDING, 1))
                         scenes[i]["duration"] = final_dur
-                        log(f"  ✅ Audio cảnh {i+1}: đọc {aud_dur:.1f}s | target {target_dur:.0f}s → scene {final_dur:.1f}s" + (" + sub" if scenes[i].get('srtFile') else ""))
+                        if tts_succeeded:
+                            log(f"  ✅ Audio cảnh {i+1}: đọc {aud_dur:.1f}s | target {target_dur:.0f}s → scene {final_dur:.1f}s" + (" + sub" if scenes[i].get('srtFile') else ""))
+                        else:
+                            log(f"  ⚪ Cảnh {i+1}: silence {final_dur:.1f}s; {aud_dur:.1f}s chỉ là ước lượng nhịp, KHÔNG phải audio.")
+
+                        # Lưu tiến độ sau từng cảnh để lần chạy sau tiếp tục đúng
+                        # từ cache, kể cả khi CapCut rate-limit giữa một dự án dài.
+                        proj.update({"scenes": scenes, "step": 3})
+                        save_proj(proj)
+
+                        # Với chế độ giữ nguyên giọng, nhiều lỗi liên tiếp gần như
+                        # chắc chắn là provider đang rate-limit. Dừng batch ngay,
+                        # không phí hàng chục phút và tuyệt đối không render silence.
+                        if (
+                            not _allow_voice_fallback
+                            and not _force_edge
+                            and _consecutive_tts_failures >= 2
+                        ):
+                            _tts_batch_aborted = True
+                            _tts_abort_scene = i + 1
+                            log("  🛑 CapCut lỗi 2 cảnh liên tiếp — dừng batch TTS để bảo vệ giọng đã chọn.")
+                            log("     Các cảnh thành công đã được lưu cache. Chờ 1–2 phút rồi bấm Render lại để tiếp tục.")
+                            break
                     proj.update({"scenes": scenes, "step": 3})
                     save_proj(proj)
+
+                    if _tts_batch_aborted:
+                        st.error(
+                            f"CapCut đang giới hạn yêu cầu tại cảnh {_tts_abort_scene}. "
+                            "Đã dừng trước khi render để video không có cảnh im lặng. "
+                            "Các cảnh thành công đã lưu; chờ 1–2 phút rồi bấm Render lại."
+                        )
+                        st.stop()
 
                 # STEP 4: Render
                 log("🎞️ Render video...")
@@ -4343,6 +5044,64 @@ with tab_main:
                     s_dir = work / f"s{i}"
                     s_dir.mkdir(exist_ok=True)
 
+                    # ── PER-SCENE RENDER CACHE ─────────────────────────────────────────────
+                    # Hash tất cả tham số ảnh hưởng render. Với file local, đưa cả
+                    # size + mtime vào fingerprint để nhận ra file bị ghi đè cùng path.
+                    import hashlib as _hc
+
+                    def _render_input_fingerprint(value):
+                        if not value:
+                            return ""
+                        raw_value = str(value)
+                        candidate = Path(raw_value)
+                        try:
+                            if candidate.is_file():
+                                stat = candidate.stat()
+                                return f"{candidate.resolve()}:{stat.st_size}:{stat.st_mtime_ns}"
+                        except (OSError, ValueError):
+                            pass
+                        return raw_value
+
+                    _resolved_sfx_name = s.get("soundEffect")
+                    if _resolved_sfx_name is None:
+                        # Không tự chèn click/whoosh vào đầu lời thoại. Những âm
+                        # ngắn này rất dễ bị nghe thành tiếng "bụp" giữa các cảnh.
+                        _resolved_sfx_name = "none"
+
+                    _scene_fp_parts = [
+                        "scene-render-v3-audio-declick",
+                        s.get("text", ""),
+                        _render_input_fingerprint(s.get("audioFile", "")),
+                        _render_input_fingerprint(s.get("srtFile", "")),
+                        _render_input_fingerprint(s.get("videoUrl", "")),
+                        _render_input_fingerprint(s.get("imageUrl", "")),
+                        _render_input_fingerprint(s.get("customVid", "")),
+                        _render_input_fingerprint(s.get("customImg", "")),
+                        _render_input_fingerprint(s.get("veo3Path", "")),
+                        str(s.get("duration", "")),
+                        str(s.get("videoSpeed", 1.0)),
+                        str(s.get("imageEffect", "")),
+                        str(s.get("introEffect", "")),
+                        str(_resolved_sfx_name),
+                        str(s.get("videoTrimMode", "")),
+                        str(s.get("videoTrimStart", 0.0)),
+                        str(show_sub), str(sub_style), str(enable_transition),
+                        str(W), str(H), str(voice_cfg_key), str(tts_rate),
+                    ]
+                    _scene_hash = _hc.sha256("|".join(_scene_fp_parts).encode()).hexdigest()[:20]
+                    _scene_hash_file = s_dir / ".scene_hash"
+                    _cached_scene_out = s_dir / "scene.mp4"
+                    if (
+                        _cached_scene_out.exists()
+                        and _cached_scene_out.stat().st_size > 10000
+                        and _scene_hash_file.exists()
+                        and _scene_hash_file.read_text().strip() == _scene_hash
+                    ):
+                        log(f"  ♻️ Cache hit cảnh {i+1} (hash={_scene_hash[:8]}) — skip render")
+                        scene_mp4s.append(_cached_scene_out)
+                        continue
+                    # ──────────────────────────────────────────────────────────────────────
+
                     # ── Tìm audio file: ưu tiên audioFile trong scene, fallback reconstruct từ hash ──
                     src_audio = None
                     if s.get("audioFile") and Path(s["audioFile"]).exists():
@@ -4351,7 +5110,10 @@ with tab_main:
                     else:
                         # Reconstruct hash path — dùng khi project cũ chưa lưu audioFile
                         import hashlib as _hl
-                        _hash_str = s.get("text", "") + str(voice_cfg_key) + str(tts_rate)
+                        _hash_str = (
+                            f"tts-cache-v2|{s.get('text', '')}|{voice_cfg_key}|{tts_rate}|"
+                            f"force-edge={bool(_force_edge)}|fallback={bool(_allow_voice_fallback)}"
+                        )
                         _h = _hl.md5(_hash_str.encode()).hexdigest()[:12]
                         _reconstructed = AUDIO_DIR / f"s{_h}.mp3"
                         if _reconstructed.exists() and _reconstructed.stat().st_size > 1000:
@@ -4367,7 +5129,11 @@ with tab_main:
                             )
                             # Thử tìm file audio ướng nhất bằng cách hash text-only
                             _text_hash_file = AUDIO_DIR / f"s{_hl.md5(s.get('text','').encode()).hexdigest()[:12]}.mp3"
-                            if _text_hash_file.exists() and _text_hash_file.stat().st_size > 1000:
+                            if (
+                                _allow_voice_fallback
+                                and _text_hash_file.exists()
+                                and _text_hash_file.stat().st_size > 1000
+                            ):
                                 src_audio = _text_hash_file
                                 log(f"  🔄 Audio cảnh {i+1}: tìm bằng text-hash fallback ({src_audio.name})")
                             else:
@@ -4378,7 +5144,8 @@ with tab_main:
                                 _retry_result = tts(
                                     s.get("text", ""), voice_cfg_key,
                                     srt_out=str(_inline_srt) if _inline_srt else None,
-                                    rate=tts_rate
+                                    rate=tts_rate,
+                                    allow_edge_fallback=_allow_voice_fallback,
                                 )
                                 if _retry_result and Path(_retry_result).exists():
                                     shutil.copy(_retry_result, _inline_audio)
@@ -4417,7 +5184,9 @@ with tab_main:
                     audio_path = s_dir / "audio_trimmed.aac"
                     if src_audio and src_audio.exists():
                         ffmpeg("-i", str(src_audio),
-                               "-af", f"apad=pad_dur={dur}",
+                               # Fade 35ms đủ đưa biên sóng về zero, không làm
+                               # mất phụ âm/chữ đầu như fade dài 150ms.
+                               "-af", f"afade=t=in:st=0:d=0.035,apad=pad_dur={dur}",
                                "-t", str(dur),
                                "-c:a", "aac", "-ar", "44100", "-ac", "2", "-b:a", "128k", "-y", str(audio_path))
                     else:
@@ -4479,6 +5248,7 @@ with tab_main:
                                 orientation=vid_orientation,
                                 used_urls=used_urls_render,
                                 scene_text=s.get("text", ""),
+                                veo3_prompt=s.get("veo3_prompt", ""),
                                 log_cb=log,
                                 force_veo3=(st.session_state.get("proj_mode") == "veo3")
                             )
@@ -4541,19 +5311,9 @@ with tab_main:
                     aud_dur = s.get("audioDur", dur)
                     speed = min(2.0, aud_dur / dur) if aud_dur > dur else 1.0
 
-                    # Transitions & Audio Filters
+                    # Transitions
                     # Giảm fade xuống 0.15s để chỉ chớp mờ chuyển cảnh, không bị đen lâu
                     v_fade = f",fade=t=in:st=0:d=0.15,fade=t=out:st={dur-0.15}:d=0.15" if enable_transition else ""
-                    af_list = []
-                    if speed > 1.0:
-                        af_list.append(f"atempo={speed}")
-                    
-                    # BỎ fade-out audio vì nó sẽ làm mất/nhỏ tiếng chữ cuối cùng của lời đọc
-                    if enable_transition:
-                        af_list.append(f"afade=t=in:ss=0:d=0.15")
-                        
-                    a_fade = ",".join(af_list)
-
                     def _sub_filter(ass_path):
                         """Return ass= FFmpeg filter string with properly escaped path."""
                         p = str(ass_path).replace("\\", "\\\\").replace(":", "\\:")
@@ -4623,7 +5383,11 @@ with tab_main:
                     else:
                         start_time = 0.0
 
-                    scale_crop = f"fps=30,scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H}"
+                    # Tốc độ video nền (0.25x–2.0x). Không ảnh hưởng audio TTS.
+                    _bg_speed = float(s.get("videoSpeed", 1.0))
+                    if _bg_speed <= 0 or _bg_speed > 4.0: _bg_speed = 1.0
+                    _setpts = f",setpts={round(1.0/_bg_speed, 4)}*PTS" if _bg_speed != 1.0 else ""
+                    scale_crop = f"fps=30,scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H}{_setpts}"
 
                     # Hiệu ứng intro: Nếu chưa chọn → auto random (trừ khi tắt đi = "none")
                     scene_intro_effect = s.get("introEffect")  # None = random, "none" = tắt hẳn
@@ -4742,10 +5506,7 @@ with tab_main:
                                 shutil.copy(base_out, out)
 
                     # ── Sound Effect: auto-random nếu chưa chọn ──
-                    sfx_name = s.get("soundEffect")
-                    if sfx_name is None:
-                        # Tự động chọn: 60% không có (viêm mắt), 40% có hiệu ứng nhẹ
-                        sfx_name = random.choice(["none", "none", "none", "whoosh", "chime", "click", "none", "whoosh"])
+                    sfx_name = _resolved_sfx_name
                     if sfx_name and sfx_name != "none" and out.exists():
                         sfx_out = s_dir / "scene_sfx.mp4"
                         ok = apply_sound_effect_to_scene(out, sfx_name, sfx_out)
@@ -4753,23 +5514,40 @@ with tab_main:
                             shutil.move(str(sfx_out), str(out))
                             log(f"  🔊 Sound effect: {sfx_name}")
 
+                    # Ghi hash cache sau khi render thành công — lần sau sẽ skip
+                    if out.exists() and out.stat().st_size > 10000:
+                        try:
+                            _scene_hash_file.write_text(_scene_hash)
+                        except Exception:
+                            pass
                     scene_mp4s.append(out)
 
-                # Concat — normalize PTS và giữ audio stream nhất quán
-                # Quan trọng: dùng -map 0:v -map 0:a để đảm bảo audio không bị drop
+                # Các scene đã được chuẩn hóa H.264/AAC cùng resolution/fps ở trên.
+                # Thử concat stream-copy trước (nhanh, không giảm chất lượng); nếu một
+                # project cũ có codec/timebase lệch thì fallback sang normalize encode.
                 concat_txt = work / "concat.txt"
                 concat_txt.write_text("\n".join(f"file '{p}'" for p in scene_mp4s))
                 raw_final = work / "final.mp4"
-                ffmpeg(
-                    "-f", "concat", "-safe", "0", "-i", str(concat_txt),
-                    "-vf", f"fps=30,scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H}",
-                    "-vsync", "cfr",
-                    "-c:v", "libx264", "-preset", "fast", "-crf", "20",
-                    "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
-                    "-map", "0:v", "-map", "0:a",   # ← explicit map — tránh mất audio
-                    "-movflags", "+faststart",
-                    "-y", str(raw_final)
-                )
+                try:
+                    ffmpeg(
+                        "-f", "concat", "-safe", "0", "-i", str(concat_txt),
+                        "-map", "0:v", "-map", "0:a",
+                        "-c", "copy", "-movflags", "+faststart",
+                        "-y", str(raw_final)
+                    )
+                    log("⚡ Ghép scene bằng stream-copy (không encode lại).")
+                except Exception as copy_error:
+                    log(f"  ↪️ Stream-copy không tương thích ({copy_error}); đang encode chuẩn hóa...")
+                    ffmpeg(
+                        "-f", "concat", "-safe", "0", "-i", str(concat_txt),
+                        "-vf", f"fps=30,scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H}",
+                        "-vsync", "cfr",
+                        "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+                        "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+                        "-map", "0:v", "-map", "0:a",
+                        "-movflags", "+faststart",
+                        "-y", str(raw_final)
+                    )
 
                 # Mix background music — hỗ trợ cả upload lẫn local path
                 _effective_bgm = bgm_file or (_bgm_local_path and Path(_bgm_local_path).exists())
@@ -4952,6 +5730,15 @@ with tab_main:
             
             scenes = proj.get("scenes", [])
             total_scenes = len(scenes)
+
+        @st.fragment
+        def _scene_editor_fragment():
+            proj = st.session_state.proj
+            cfg  = load_cfg()
+
+            scenes = proj.get("scenes", [])
+            total_scenes = len(scenes)
+
             edited = False
 
             if total_scenes > 0:
@@ -5092,7 +5879,7 @@ with tab_main:
                                     "veo3_prompt_label",
                                     value=veo3_prompt,
                                     key=f"veo3_{idx}",
-                                    height=100,
+                                    height=350,
                                     label_visibility="collapsed",
                                     placeholder="📋 Prompt chưa có — bấm '✨ AI Tạo Prompt' để sinh tự động, hoặc tự nhập tiếng Anh mô tả cảnh này (lighting, camera angle, subject, mood...)"
                                 )
@@ -5100,18 +5887,99 @@ with tab_main:
                                     proj["scenes"][idx]["veo3_prompt"] = new_veo3
                                     edited = True
                             with _veo_col2:
-                                if st.button("✨ AI Tạo\nPrompt", key=f"gen_veo_{idx}", use_container_width=True, help="AI tự viết prompt tiếng Anh cho Veo3/Sora dựa trên lời đọc"):
+                                if st.button("✨ AI Tạo\nPrompt", key=f"gen_veo_{idx}", use_container_width=True, help="AI viết prompt chuẩn Veo3/Sora (Netflix Documentary style)"):
                                     with st.spinner("AI đang viết..."):
                                         try:
                                             _txt = scene.get("text", "")
-                                            _prompt = f"Write a highly detailed, cinematic English prompt for an AI video generator (like Sora/Veo3) based on this narration: '{_txt}'. Describe lighting, camera angle, subject emotion, and background. Reply ONLY with the prompt string, no markdown."
-                                            _res = call_ai(_prompt).strip().strip('"').strip("'")
+                                            _lc = proj.get("lang", "Korean")
+                                            _nat = "South Korean" if _lc == "Korean" else "Vietnamese" if _lc == "Vietnamese" else "Western"
+                                            _ap = (
+                                                f"Based on this narration: '{_txt}'\n\n"
+                                                f"Write 3 short English sections for a cinematic documentary video prompt:\n"
+                                                f"1. CHARACTER: {_nat} character appearance, clothing, emotional state. 2-3 sentences.\n"
+                                                f"2. ACTION: Natural movements, expressions, gestures. 2-3 sentences.\n"
+                                                f"3. ENVIRONMENT: Authentic {_nat} location, architectural details, atmosphere. 2-3 sentences.\n\n"
+                                                'Return ONLY JSON: {"character":"...","action":"...","environment":"..."}\nNo markdown.'
+                                            )
+                                            _raw = call_ai(_ap).strip()
+                                            try:
+                                                _p = parse_json_robust(_raw)
+                                                _c = _p.get("character","").strip()
+                                                _a = _p.get("action","").strip()
+                                                _e = _p.get("environment","").strip()
+                                            except Exception:
+                                                _c = f"A realistic {_nat} person with authentic appearance."
+                                                _a = "Moves naturally with subtle expressions and body language."
+                                                _e = f"Authentic {_nat} urban setting with everyday atmosphere."
+                                            _res = build_veo3_prompt(_c, _a, _e, _nat)
                                             if _res:
                                                 proj["scenes"][idx]["veo3_prompt"] = _res
                                                 save_proj(proj)
-                                                st.rerun()
+                                                st.rerun(scope="fragment")
                                         except Exception as e:
                                             st.error(f"Lỗi: {e}")
+
+                            # Gemini Web mode: use the user's existing Google AI
+                            # subscription with an explicit human confirmation,
+                            # then attach the downloaded MP4 to this scene.
+                            with st.expander("🌐 Gemini Web — tạo bằng tài khoản Pro/Ultra", expanded=False):
+                                st.caption(
+                                    "1) Tải/copy prompt → 2) mở Gemini Create video → "
+                                    "3) tải MP4 về Downloads → 4) chọn file và nhập vào cảnh."
+                                )
+                                _web_prompt = proj["scenes"][idx].get("veo3_prompt", "") or new_veo3
+                                _web_col1, _web_col2 = st.columns(2)
+                                with _web_col1:
+                                    st.link_button(
+                                        "↗️ Mở Gemini Create video",
+                                        "https://gemini.google.com/app",
+                                        use_container_width=True,
+                                    )
+                                with _web_col2:
+                                    st.download_button(
+                                        "⬇️ Tải prompt .txt",
+                                        data=_web_prompt,
+                                        file_name=f"scene_{idx + 1}_veo_prompt.txt",
+                                        mime="text/plain",
+                                        use_container_width=True,
+                                        key=f"download_web_prompt_{idx}",
+                                    )
+
+                                _downloads_dir = Path.home() / "Downloads"
+                                try:
+                                    _recent_web_videos = sorted(
+                                        (
+                                            p for p in _downloads_dir.glob("*.mp4")
+                                            if p.is_file() and p.stat().st_size > 10_000
+                                        ),
+                                        key=lambda p: p.stat().st_mtime,
+                                        reverse=True,
+                                    )[:12]
+                                except OSError:
+                                    _recent_web_videos = []
+
+                                if _recent_web_videos:
+                                    _selected_web_video = st.selectbox(
+                                        "MP4 mới tải trong Downloads",
+                                        _recent_web_videos,
+                                        format_func=lambda p: f"{p.name} · {p.stat().st_size / 1_000_000:.1f} MB",
+                                        key=f"gemini_web_download_{idx}",
+                                    )
+                                    if st.button(
+                                        "✅ Dùng MP4 này cho cảnh",
+                                        key=f"import_gemini_web_{idx}",
+                                        use_container_width=True,
+                                    ):
+                                        proj["scenes"][idx]["customVid"] = str(_selected_web_video)
+                                        proj["scenes"][idx]["videoUrl"] = None
+                                        proj["scenes"][idx]["imageUrl"] = None
+                                        proj["scenes"][idx]["customImg"] = None
+                                        proj["scenes"][idx]["veo3Path"] = None
+                                        save_proj(proj)
+                                        st.success(f"Đã gắn {_selected_web_video.name} vào cảnh {idx + 1}")
+                                        st.rerun(scope="fragment")
+                                else:
+                                    st.info("Chưa thấy file MP4 nào trong thư mục Downloads.")
                             
                             # Nút dịch Voice
                             col_tr_btn, col_tr_val = st.columns([1, 3])
@@ -5151,7 +6019,7 @@ with tab_main:
                                                     proj["scenes"][idx]["keyword"] = ai_kw
                                                     save_proj(proj)
                                                     st.success(f"✅ Đã cập nhật keyword gợi ý!")
-                                                    st.rerun()
+                                                    st.rerun(scope="fragment")
                                             except Exception as ex:
                                                 st.error(f"Lỗi gợi ý: {ex}")
                             
@@ -5197,7 +6065,7 @@ with tab_main:
                                                 proj["scenes"][idx]["videoUrl"]  = None
                                             else:
                                                 proj["scenes"][idx]["videoUrl"]  = _pick_auto["url"]
-                                                proj["scenes"][idx]["duration"]  = _pick_auto.get("duration", scene.get("duration", 5))
+                                                # Không ghi đè duration — ffmpeg cắt theo scene duration
                                                 proj["scenes"][idx]["imageUrl"]  = None
                                             proj["scenes"][idx]["customVid"] = None
                                             proj["scenes"][idx]["customImg"] = None
@@ -5209,7 +6077,7 @@ with tab_main:
                                             save_proj(proj)
                                         # Đánh dấu đã fetch dù kết quả thế nào
                                         st.session_state[_auto_done_key] = True
-                                        st.rerun()
+                                        st.rerun(scope="fragment")
                                     except Exception as _ae:
                                         st.session_state[_auto_done_key] = True  # tránh loop lỗi
 
@@ -5227,13 +6095,13 @@ with tab_main:
                                                 _pick = next((r for r in (_res or []) if not r.get("already_used")), None) or (_res[0] if _res else None)
                                                 if _pick:
                                                     proj["scenes"][idx]["videoUrl"] = _pick["url"]
-                                                    proj["scenes"][idx]["duration"] = _pick.get("duration", scene.get("duration", 5))
+                                                    # Không ghi đè duration — giữ duration từ text
                                                     proj["scenes"][idx]["imageUrl"] = proj["scenes"][idx]["customVid"] = proj["scenes"][idx]["customImg"] = None
                                                     if "used_videos" not in cfg: cfg["used_videos"] = []
                                                     if _pick["url"] not in cfg["used_videos"]: cfg["used_videos"].append(_pick["url"])
                                                     save_cfg(cfg); save_proj(proj)
                                                     st.session_state[_auto_done_key] = True
-                                                    st.rerun()
+                                                    st.rerun(scope="fragment")
                                 with _auto_col2:
                                     if st.button("⚡ Auto-chọn Ảnh (Pexels)", key=f"auto_img_{idx}",
                                                   use_container_width=True,
@@ -5250,7 +6118,7 @@ with tab_main:
                                                     if _pick["url"] not in cfg["used_videos"]: cfg["used_videos"].append(_pick["url"])
                                                     save_cfg(cfg); save_proj(proj)
                                                     st.session_state[_auto_done_key] = True
-                                                    st.rerun()
+                                                    st.rerun(scope="fragment")
 
                             # ── Chọn video từ máy — nằm ngoài tabs, luôn visible ──
                             with st.expander("📁 Dùng video từ máy", expanded=False):
@@ -5307,7 +6175,7 @@ with tab_main:
                                                 pass  # giữ nguyên duration cũ nếu probe lỗi
                                             save_proj(proj)
                                             st.success(f"✅ Đã dùng: {Path(_chosen_path).name}")
-                                            st.rerun()
+                                            st.rerun(scope="fragment")
                                         else:
                                             st.error("❌ Không tìm thấy file — kiểm tra lại đường dẫn.")
 
@@ -5359,7 +6227,7 @@ with tab_main:
                                                         proj["scenes"][idx]["customVid"] = None
                                                         proj["scenes"][idx]["imageUrl"] = None
                                                         proj["scenes"][idx]["customImg"] = None
-                                                        proj["scenes"][idx]["duration"] = res["duration"]
+                                                        # Không ghi đè duration — giữ duration từ text
                                                         if "used_videos" not in cfg:
                                                             cfg["used_videos"] = []
                                                         if res["url"] not in cfg["used_videos"]:
@@ -5368,7 +6236,7 @@ with tab_main:
                                                                 cfg["used_videos"].pop(0)
                                                         save_cfg(cfg)
                                                         edited = True
-                                                        st.rerun()
+                                                        st.rerun(scope="fragment")
 
                             with tab_pixabay_vid:
                                 pix_key = cfg.get("pixabay", "")
@@ -5412,7 +6280,7 @@ with tab_main:
                                                         proj["scenes"][idx]["customVid"] = None
                                                         proj["scenes"][idx]["imageUrl"] = None
                                                         proj["scenes"][idx]["customImg"] = None
-                                                        proj["scenes"][idx]["duration"] = res["duration"]
+                                                        # Không ghi đè duration — giữ duration từ text
                                                         if "used_videos" not in cfg:
                                                             cfg["used_videos"] = []
                                                         if res["url"] not in cfg["used_videos"]:
@@ -5421,7 +6289,7 @@ with tab_main:
                                                                 cfg["used_videos"].pop(0)
                                                         save_cfg(cfg)
                                                         edited = True
-                                                        st.rerun()
+                                                        st.rerun(scope="fragment")
 
                             with tab_coverr_vid:
                                 st.markdown("**🔍 Tìm video trên Coverr (Free, không cần API key):**")
@@ -5461,7 +6329,7 @@ with tab_main:
                                                     proj["scenes"][idx]["customVid"] = None
                                                     proj["scenes"][idx]["imageUrl"] = None
                                                     proj["scenes"][idx]["customImg"] = None
-                                                    proj["scenes"][idx]["duration"] = res["duration"]
+                                                    # Không ghi đè duration — giữ duration từ text
                                                     if "used_videos" not in cfg:
                                                         cfg["used_videos"] = []
                                                     if res["url"] not in cfg["used_videos"]:
@@ -5470,7 +6338,7 @@ with tab_main:
                                                             cfg["used_videos"].pop(0)
                                                     save_cfg(cfg)
                                                     edited = True
-                                                    st.rerun()
+                                                    st.rerun(scope="fragment")
 
                             with tab_pexels_photo:
                                 pexels_key = (cfg.get("pexels") or [None])[0]
@@ -5522,7 +6390,7 @@ with tab_main:
                                                                 cfg["used_videos"].pop(0)
                                                         save_cfg(cfg)
                                                         edited = True
-                                                        st.rerun()
+                                                        st.rerun(scope="fragment")
 
                             with tab_pixabay_photo:
                                 pix_key = cfg.get("pixabay", "")
@@ -5574,7 +6442,7 @@ with tab_main:
                                                                 cfg["used_videos"].pop(0)
                                                         save_cfg(cfg)
                                                         edited = True
-                                                        st.rerun()
+                                                        st.rerun(scope="fragment")
 
 
                             with tab_upload:
@@ -5619,7 +6487,7 @@ with tab_main:
                                 if st.button("Xóa ảnh tải lên", key=f"del_img_{idx}"):
                                     proj["scenes"][idx]["customImg"] = None
                                     edited = True
-                                    st.rerun()
+                                    st.rerun(scope="fragment")
                                 has_any_video = True
                             # Ảnh stock đã chọn
                             elif scene.get("imageUrl"):
@@ -5628,7 +6496,7 @@ with tab_main:
                                 if st.button("Xóa ảnh stock", key=f"del_img_url_{idx}"):
                                     proj["scenes"][idx]["imageUrl"] = None
                                     edited = True
-                                    st.rerun()
+                                    st.rerun(scope="fragment")
                                 has_any_video = True
                             # Video upload / chọn từ máy
                             elif proj["scenes"][idx].get("customVid") and Path(proj["scenes"][idx]["customVid"]).exists():
@@ -5641,7 +6509,7 @@ with tab_main:
                                 if st.button("Xóa video tải lên", key=f"del_{idx}"):
                                     proj["scenes"][idx]["customVid"] = None
                                     edited = True
-                                    st.rerun()
+                                    st.rerun(scope="fragment")
                                 has_any_video = True
 
                             elif scene.get("videoUrl"):
@@ -5650,7 +6518,7 @@ with tab_main:
                                 if st.button("Xóa liên kết video", key=f"del_url_{idx}"):
                                     proj["scenes"][idx]["videoUrl"] = None
                                     edited = True
-                                    st.rerun()
+                                    st.rerun(scope="fragment")
                                 has_any_video = True
                             else:
                                 st.warning("⚠️ Chưa chọn nền")
@@ -5665,8 +6533,9 @@ with tab_main:
                                 else:
                                     st.caption("↓ Hoặc để trống → tool tự tìm **video Pexels**")
                                 
-                            new_mode = "start"
-                            new_start = 0.0
+                            # Đọc từ scene hiện tại làm default — tránh ghi đè khi widget không hiển thị
+                            new_mode = scene.get("videoTrimMode", "start")
+                            new_start = float(scene.get("videoTrimStart", 0.0))
                             if has_any_video:
                                 st.markdown("---")
                                 trim_options = {
@@ -5742,6 +6611,260 @@ with tab_main:
                                 proj["scenes"][idx]["introEffect"] = new_intro
                                 edited = True
 
+                            # ── Video Speed Control ──
+                            _speed_opts = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
+                            _speed_labels = {
+                                0.25: "0.25x (rất chậm — cinematic)",
+                                0.5:  "0.5x (chậm — lời đọc nhanh)",
+                                0.75: "0.75x (hơi chậm)",
+                                1.0:  "1.0x (bình thường)",
+                                1.25: "1.25x (hơi nhanh)",
+                                1.5:  "1.5x (nhanh)",
+                                2.0:  "2.0x (rất nhanh — hyper)",
+                            }
+                            _curr_spd = float(scene.get("videoSpeed", 1.0))
+                            if _curr_spd not in _speed_opts: _curr_spd = 1.0
+                            _new_spd = st.select_slider(
+                                "⚡ Tốc độ video nền:",
+                                options=_speed_opts,
+                                value=_curr_spd,
+                                format_func=lambda x: _speed_labels[x],
+                                key=f"vid_speed_{idx}",
+                                help="Làm chậm video nền → người xem tập trung vào lời đọc hơn. Không ảnh hưởng TTS/âm thanh."
+                            )
+                            if _new_spd != scene.get("videoSpeed", 1.0):
+                                proj["scenes"][idx]["videoSpeed"] = _new_spd
+                                edited = True
+
+                            # ── Nút Render đơn cảnh ─────────────────────────────────────────
+                            st.markdown("---")
+                            _rcol1, _rcol2 = st.columns([1, 1])
+                            with _rcol1:
+                                _btn_render_one = st.button(
+                                    "⚡ Render cảnh này",
+                                    key=f"btn_render_one_{idx}",
+                                    use_container_width=True,
+                                    help="Chỉ render lại cảnh này — không ảnh hưởng cảnh khác"
+                                )
+                            with _rcol2:
+                                _btn_preview_one = st.button(
+                                    "▶️ Preview cảnh này",
+                                    key=f"btn_preview_one_{idx}",
+                                    use_container_width=True,
+                                    help="Xem video cảnh vừa render"
+                                )
+
+                            if _btn_render_one:
+                                # Lưu thay đổi trước khi render
+                                save_proj(proj)
+                                _s = proj["scenes"][idx]
+                                _proj_mode_slug_r = st.session_state.get("proj_mode", "main")
+                                _work_r = TMP / f"proj_{_proj_mode_slug_r}"
+                                _work_r.mkdir(exist_ok=True)
+                                _s_dir_r = _work_r / f"s{idx}"
+                                _s_dir_r.mkdir(exist_ok=True)
+
+                                # Xóa hash cũ để buộc re-render
+                                _hash_file_r = _s_dir_r / ".scene_hash"
+                                if _hash_file_r.exists():
+                                    _hash_file_r.unlink()
+
+                                # Lấy cấu hình hiện tại
+                                _cfg_r = load_cfg()
+                                _aspect_r = proj.get("aspect", "9:16 (Shorts/TikTok)")
+                                _W_r, _H_r = (1080, 1920) if "9:16" in _aspect_r else (1920, 1080)
+                                _sub_style_r = proj.get("sub_style", "🟡 TikTok Yellow (Viral)")
+                                _show_sub_r = bool(_s.get("srtFile") and Path(_s["srtFile"]).exists())
+                                _enable_trans_r = proj.get("enable_transition", False)
+                                _voice_r = proj.get("voice_cfg_key", "en-US")
+                                _rate_r = proj.get("tts_rate", "1.0")
+
+                                with st.spinner(f"⚡ Đang render cảnh {idx+1}..."):
+                                    try:
+                                        # Audio
+                                        _src_audio_r = None
+                                        _audio_file_r = _s.get("audioFile", "")
+                                        if _audio_file_r and Path(_audio_file_r).exists():
+                                            _src_audio_r = Path(_audio_file_r)
+
+                                        # Duration
+                                        _dur_r = float(_s.get("duration") or 5.0)
+                                        if _src_audio_r:
+                                            try:
+                                                _probe_r = subprocess.run(
+                                                    [FFMPEG, "-i", str(_src_audio_r), "-f", "null", "-"],
+                                                    capture_output=True, text=True
+                                                )
+                                                for _ln_r in _probe_r.stderr.split("\n"):
+                                                    if "Duration:" in _ln_r:
+                                                        _ts_r = _ln_r.split("Duration:")[1].split(",")[0].strip()
+                                                        _hh_r, _mm_r, _ss_r = _ts_r.split(":")
+                                                        _real_r = int(_hh_r)*3600 + int(_mm_r)*60 + float(_ss_r)
+                                                        if _real_r > 0.5:
+                                                            _dur_r = max(1.5, round(_real_r + 0.05, 2))
+                                                        break
+                                            except Exception:
+                                                pass
+
+                                        # Trim audio
+                                        _audio_trim_r = _s_dir_r / "audio_trimmed.aac"
+                                        if _src_audio_r and _src_audio_r.exists():
+                                            ffmpeg("-i", str(_src_audio_r),
+                                                   "-af", f"afade=t=in:st=0:d=0.035,apad=pad_dur={_dur_r}",
+                                                   "-t", str(_dur_r),
+                                                   "-c:a", "aac", "-ar", "44100", "-ac", "2", "-b:a", "128k",
+                                                   "-y", str(_audio_trim_r))
+                                        else:
+                                            ffmpeg("-f","lavfi","-i","anullsrc=r=44100:cl=stereo",
+                                                   "-t",str(_dur_r),"-c:a","aac","-ar","44100","-ac","2",
+                                                   "-b:a","128k","-y",str(_audio_trim_r))
+
+                                        # Visual source
+                                        _vid_r = _s_dir_r / "video.mp4"
+                                        _has_vid_r = False
+                                        for _src_key in ["customImg", "imageUrl", "customVid", "veo3Path", "videoUrl"]:
+                                            _sv = _s.get(_src_key, "")
+                                            if not _sv:
+                                                continue
+                                            _sp = Path(_sv) if _sv.startswith("/") else None
+                                            if _sp and _sp.exists():
+                                                import shutil as _sh
+                                                _sh.copy(_sp, _vid_r)
+                                                _has_vid_r = _vid_r.stat().st_size > 5000
+                                            elif _sv.startswith("http"):
+                                                try:
+                                                    download_url(_sv, str(_vid_r))
+                                                    _has_vid_r = _vid_r.exists() and _vid_r.stat().st_size > 5000
+                                                except Exception:
+                                                    pass
+                                            if _has_vid_r:
+                                                break
+
+                                        # FFmpeg render core
+                                        _base_r = _s_dir_r / "base.mp4"
+                                        _bg_speed_r = float(_s.get("videoSpeed", 1.0))
+                                        if _bg_speed_r <= 0 or _bg_speed_r > 4.0: _bg_speed_r = 1.0
+                                        _setpts_r = f",setpts={round(1.0/_bg_speed_r,4)}*PTS" if _bg_speed_r != 1.0 else ""
+                                        _scale_r = f"fps=30,scale={_W_r}:{_H_r}:force_original_aspect_ratio=increase,crop={_W_r}:{_H_r}{_setpts_r}"
+
+                                        if _has_vid_r:
+                                            _is_img_r = is_image_file(str(_vid_r))
+                                            if _is_img_r:
+                                                _scale_r = make_image_effect_filter(_W_r, _H_r, _dur_r, effect=_s.get("imageEffect"))
+                                                _vin_r = ["-i", str(_vid_r)]
+                                            else:
+                                                # Probe video duration to calculate start time for trim
+                                                _vid_len_r = 0.0
+                                                try:
+                                                    _probe_v_r = subprocess.run(
+                                                        [FFMPEG, "-i", str(_vid_r), "-f", "null", "-"],
+                                                        capture_output=True, text=True
+                                                    )
+                                                    for _line_r in _probe_v_r.stderr.split("\n"):
+                                                        if "Duration:" in _line_r:
+                                                            _ts2_r = _line_r.split("Duration:")[1].split(",")[0].strip()
+                                                            _hh2_r, _mm2_r, _ss2_r = _ts2_r.split(":")
+                                                            _vid_len_r = int(_hh2_r)*3600 + int(_mm2_r)*60 + float(_ss2_r)
+                                                            break
+                                                except Exception:
+                                                    _vid_len_r = _dur_r
+
+                                                _trim_mode_r = _s.get("videoTrimMode") or "random"
+                                                _start_time_r = 0.0
+                                                if _vid_len_r > _dur_r:
+                                                    if _trim_mode_r == "middle":
+                                                        _start_time_r = max(0.0, (_vid_len_r - _dur_r) / 2.0)
+                                                    elif _trim_mode_r == "end":
+                                                        _start_time_r = max(0.0, _vid_len_r - _dur_r)
+                                                    elif _trim_mode_r == "random":
+                                                        _max_start_r = max(0.0, _vid_len_r - _dur_r)
+                                                        _start_time_r = random.uniform(0.0, min(_max_start_r, _vid_len_r * 0.6))
+                                                    elif _trim_mode_r == "custom":
+                                                        _cs_r = float(_s.get("videoTrimStart", 0.0))
+                                                        _start_time_r = min(_cs_r, max(0.0, _vid_len_r - _dur_r))
+                                                    else: # "start"
+                                                        _start_time_r = 0.0
+
+                                                if _vid_len_r > 0 and _vid_len_r < _dur_r:
+                                                    _vin_r = ["-stream_loop", "-1", "-i", str(_vid_r)]
+                                                else:
+                                                    _vin_r = ["-ss", str(_start_time_r), "-i", str(_vid_r)]
+                                            _cmd_r = _vin_r + [
+                                                "-i", str(_audio_trim_r),
+                                                "-vf", _scale_r, "-t", str(_dur_r),
+                                                "-c:v", "libx264", "-preset", "fast", "-crf", "22",
+                                                "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+                                                "-map", "0:v", "-map", "1:a", "-shortest", "-y", str(_base_r)
+                                            ]
+                                        else:
+                                            _black_r = f"color=c=black:s={_W_r}x{_H_r}:r=30"
+                                            _cmd_r = [
+                                                "-f","lavfi","-i",_black_r,"-i",str(_audio_trim_r),
+                                                "-t",str(_dur_r),"-c:v","libx264","-preset","fast","-crf","22",
+                                                "-c:a","aac","-b:a","128k","-ar","44100",
+                                                "-map","0:v","-map","1:a","-shortest","-y",str(_base_r)
+                                            ]
+                                        ffmpeg(*_cmd_r)
+
+                                        # Subtitle
+                                        _out_r = _s_dir_r / "scene.mp4"
+                                        _srt_r = _s.get("srtFile")
+                                        _has_srt_r = False
+                                        if _show_sub_r and HAS_SUB and _srt_r and Path(_srt_r).exists():
+                                            try:
+                                                _wl_r = srt_to_words(_srt_r)
+                                                if _wl_r:
+                                                    _ass_c = make_ass(_wl_r, W=_W_r, H=_H_r, style_name=_sub_style_r)
+                                                    _ass_r = _s_dir_r / "sub.ass"
+                                                    _ass_r.write_text(_ass_c, encoding="utf-8")
+                                                    _p_r = str(_ass_r).replace("\\", "\\\\").replace(":", "\\:")
+                                                    ffmpeg("-i", str(_base_r), "-vf", f"ass='{_p_r}'",
+                                                           "-c:v", "libx264", "-preset", "fast", "-crf", "22",
+                                                           "-c:a", "copy", "-y", str(_out_r))
+                                                    _has_srt_r = True
+                                            except Exception as _se_r:
+                                                st.warning(f"Sub lỗi: {_se_r}")
+
+                                        if not _has_srt_r:
+                                            if _base_r.exists():
+                                                import shutil as _sh2
+                                                _sh2.copy(_base_r, _out_r)
+
+                                        # Ghi hash cache
+                                        import hashlib as _hcr
+                                        _fp_r = "|".join([
+                                            _s.get("text",""), str(_s.get("audioFile","")),
+                                            str(_s.get("videoUrl","")), str(_s.get("imageUrl","")),
+                                            str(_s.get("customVid","")), str(_s.get("customImg","")),
+                                            str(_s.get("veo3Path","")), str(_s.get("duration","")),
+                                            str(_s.get("videoSpeed",1.0)), str(_s.get("imageEffect","")),
+                                            str(_s.get("introEffect","")), str(_s.get("soundEffect","")),
+                                            str(_s.get("videoTrimMode","")), str(_s.get("videoTrimStart",0.0)),
+                                            str(_show_sub_r), str(_sub_style_r), str(_enable_trans_r),
+                                            str(_W_r), str(_H_r), str(_voice_r), str(_rate_r),
+                                        ])
+                                        _hash_file_r.write_text(_hcr.md5(_fp_r.encode()).hexdigest()[:16])
+
+                                        if _out_r.exists() and _out_r.stat().st_size > 10000:
+                                            st.success(f"✅ Render cảnh {idx+1} xong! ({_out_r.stat().st_size//1024}KB)")
+                                            st.session_state[f"preview_scene_{idx}"] = str(_out_r)
+                                        else:
+                                            st.error("❌ Render thất bại — file không tạo được")
+                                    except Exception as _re:
+                                        st.error(f"❌ Lỗi render: {_re}")
+
+                            if _btn_preview_one or st.session_state.get(f"preview_scene_{idx}"):
+                                _preview_path = st.session_state.get(f"preview_scene_{idx}")
+                                if not _preview_path:
+                                    _proj_mode_slug_p = st.session_state.get("proj_mode", "main")
+                                    _preview_path = str(TMP / f"proj_{_proj_mode_slug_p}" / f"s{idx}" / "scene.mp4")
+                                if _preview_path and Path(_preview_path).exists():
+                                    st.video(_preview_path)
+                                else:
+                                    st.info("Chưa có video — nhấn '⚡ Render cảnh này' trước")
+                            st.markdown("---")
+                            # ────────────────────────────────────────────────────────────────
+
                             completed = st.checkbox("✅ Đã duyệt xong cảnh này", value=bool(scene.get("completed", False)), key=f"comp_{idx}")
                             
                             # Next and save button
@@ -5764,16 +6887,18 @@ with tab_main:
                         if (new_text != scene.get('text') or 
                             new_kw != scene.get('keyword') or 
                             new_dur != scene.get('duration') or 
-                            new_mode != scene.get('videoTrimMode', 'start') or
-                            (new_mode == 'custom' and new_start != scene.get('videoTrimStart', 0.0)) or
+                            (has_any_video and new_mode != scene.get('videoTrimMode', 'start')) or
+                            (has_any_video and new_mode == 'custom' and new_start != scene.get('videoTrimStart', 0.0)) or
                             completed != scene.get('completed', False)):
                             
                             proj["scenes"][idx]["text"] = new_text
                             proj["scenes"][idx]["keyword"] = new_kw
                             proj["scenes"][idx]["duration"] = new_dur
-                            proj["scenes"][idx]["videoTrimMode"] = new_mode
-                            if new_mode == "custom":
-                                proj["scenes"][idx]["videoTrimStart"] = new_start
+                            # Chỉ cập nhật trim settings khi widget thực sự được hiển thị (has_any_video)
+                            # Tránh ghi đè setting 'custom' bằng default 'start' khi không có video
+                            if has_any_video:
+                                proj["scenes"][idx]["videoTrimMode"] = new_mode
+                                proj["scenes"][idx]["videoTrimStart"] = new_start if new_mode == "custom" else 0.0
                             proj["scenes"][idx]["completed"] = completed
                             edited = True
                             
@@ -5803,7 +6928,7 @@ with tab_main:
                                 proj["scenes"][idx]["imageUrl"] = None
                                 proj["scenes"][idx]["duration"] = round(dur_seconds)
                                 edited = True
-                                st.rerun()
+                                st.rerun(scope="fragment")
 
                         # ── Xử lý upload ảnh thủ công (lấy từ widget key trong tab_img) ──
                         up_img_key = f"up_img_{idx}"
@@ -5818,7 +6943,7 @@ with tab_main:
                                 proj["scenes"][idx]["videoUrl"] = None
                                 proj["scenes"][idx]["customVid"] = None
                                 edited = True
-                                st.rerun()
+                                st.rerun(scope="fragment")
 
                                 
             if edited:
@@ -5837,6 +6962,9 @@ with tab_main:
                 txt += "\n\n".join(f"[Cảnh {i+1}]\n{sc.get('text','')}" for i, sc in enumerate(proj.get("scenes", [])))
                 st.download_button("⬇️ metadata.txt", txt, "youtube_meta.txt", "text/plain")
 
+
+
+        _scene_editor_fragment()
 
         if proj.get("finalPath") and Path(proj["finalPath"]).exists():
             st.divider()
@@ -5862,6 +6990,20 @@ with tab_main:
 
         elif proj.get("step",0) == 0 and not run_all:
             st.info("👈 Chọn cấu hình bên trái và bấm **Bắt Đầu Tự Động**\n\nSettings → thêm API keys trước")
+
+
+# ════════════════════════════════════════════════════════════
+# CREATIVE STUDIO TAB — independent non-educational workflow
+# ════════════════════════════════════════════════════════════
+with tab_creative:
+    if _CREATIVE_OK:
+        _creative.render_creative_studio(
+            call_ai, parse_json_robust, FFMPEG,
+            veo_engine=_veo3 if _VEO3_OK else None,
+            cfg=cfg,
+        )
+    else:
+        st.error("Creative Studio chưa load được. Kiểm tra file creative_studio.py.")
 
 
 # ════════════════════════════════════════════════════════════
@@ -5901,12 +7043,18 @@ with tab_veo:
         veo_resolution_sel = col_res2.selectbox("🖥️ Độ phân giải", ["720p", "1080p"], index=0, key="veo_res_sel")
         
         veo_num_scenes = st.slider("🎬 Số lượng cảnh (scenes)", min_value=2, max_value=8, value=veo_proj.get("num_scenes", 4), key="veo_scenes_slider")
-        veo_voice_lang = st.selectbox("🌍 Ngôn ngữ", ["Vietnamese", "English", "Korean"], index=0, key="veo_lang_sel")
+        veo_voice_lang = st.selectbox("🌍 Ngôn ngữ", ["Vietnamese", "English", "Korean", "Japanese"], index=0, key="veo_lang_sel")
         
         # Giọng đọc
-        if _CAPCUT_OK:
-            _v_flag = {"Vietnamese": "🇻🇳", "English": "🇺🇸", "Korean": "🇰🇷"}.get(veo_voice_lang, "🇺🇸")
-            _v_code = {"Vietnamese": "vi", "English": "en", "Korean": "ko"}.get(veo_voice_lang, "en")
+        if veo_voice_lang == "Korean":
+            veo_voice_opt = st.selectbox(
+                "🔊 Giọng đọc tiếng Hàn (Edge TTS)",
+                ["ko-KR (SunHi - Female)", "ko-KR (InJoon - Male)"],
+                key="veo_voice_opt_ko",
+            )
+        elif _CAPCUT_OK:
+            _v_flag = {"Vietnamese": "🇻🇳", "English": "🇺🇸", "Korean": "🇰🇷", "Japanese": "🇯🇵"}.get(veo_voice_lang, "🇺🇸")
+            _v_code = {"Vietnamese": "vi", "English": "en", "Korean": "ko", "Japanese": "ja"}.get(veo_voice_lang, "en")
             _v_opts = [k for k in _cc.CAPCUT_VOICES if _v_flag in k]
             _v_def  = _cc.CAPCUT_VOICE_DEFAULTS.get(_v_code, _v_opts[0])
             _v_idx  = _v_opts.index(_v_def) if _v_def in _v_opts else 0
@@ -5939,7 +7087,15 @@ with tab_veo:
 
         st.divider()
         btn_col1, btn_col2 = st.columns(2)
-        btn_generate = btn_col1.button("🚀 Bắt đầu Tạo Video", type="primary", use_container_width=True, key="veo_generate_btn")
+        _veo_api_allowed = cfg.get("veo3_provider") == "api" and cfg.get("veo3_enabled", False)
+        btn_generate = btn_col1.button(
+            "🚀 Bắt đầu Tạo Video",
+            type="primary",
+            use_container_width=True,
+            key="veo_generate_btn",
+            disabled=not _veo_api_allowed,
+            help="Chỉ hoạt động khi Settings chọn Veo API và bật công tắc dùng credit.",
+        )
         btn_reset = btn_col2.button("🗑️ Reset dự án", type="secondary", use_container_width=True, key="veo_reset_btn")
 
         if btn_reset:
@@ -5981,43 +7137,19 @@ with tab_veo:
                 f"    {{\n"
                 f"      \"id\": 1,\n"
                 f"      \"text\": \"Lời thoại của người thuyết minh cho cảnh này (tối đa 25 từ, ngắn gọn, cuốn hút)\",\n"
-                f"      \"keyword\": \"Mô tả chi tiết bằng tiếng Anh dùng để vẽ video (Ví dụ: 'a high quality cinematic shot of a glowing black hole in deep space')\"\n"
+                f"      \"keyword\": \"Từ khóa stock video ngắn bằng tiếng Anh, 2 đến 5 từ\"\n"
                 f"    }}\n"
                 f"  ]\n"
                 f"}}\n"
             )
             
-            # Gọi API sinh kịch bản (ưu tiên Gemini)
+            # Dùng chung AI routing/parser với Main Pipeline.
             gemini_keys = cfg.get("gemini", [])
             script_json = None
-            if gemini_keys:
-                try:
-                    res_raw = call_gemini(gemini_keys[0], veo_prompt)
-                    import re
-                    cleaned_raw = res_raw.strip()
-                    if cleaned_raw.startswith("```"):
-                        cleaned_raw = re.sub(r"^```[a-zA-Z]*\n", "", cleaned_raw)
-                        cleaned_raw = re.sub(r"\n```$", "", cleaned_raw)
-                    cleaned_raw = cleaned_raw.strip()
-                    script_json = json.loads(cleaned_raw)
-                except Exception as e:
-                    vlog(f"⚠️ Thử Gemini viết kịch bản lỗi: {e}")
-                    
-            if not script_json:
-                # Fallback Groq
-                groq_keys = cfg.get("groq", [])
-                if groq_keys:
-                    try:
-                        res_raw = call_groq_llm(groq_keys[0], veo_prompt)
-                        import re
-                        cleaned_raw = res_raw.strip()
-                        if cleaned_raw.startswith("```"):
-                            cleaned_raw = re.sub(r"^```[a-zA-Z]*\n", "", cleaned_raw)
-                            cleaned_raw = re.sub(r"\n```$", "", cleaned_raw)
-                        cleaned_raw = cleaned_raw.strip()
-                        script_json = json.loads(cleaned_raw)
-                    except Exception as e:
-                        vlog(f"⚠️ Thử Groq viết kịch bản lỗi: {e}")
+            try:
+                script_json = parse_json_robust(call_ai_script(veo_prompt))
+            except Exception as e:
+                vlog(f"⚠️ AI routing viết kịch bản lỗi: {e}")
             
             if not script_json:
                 status_box.error("❌ Không thể tạo kịch bản! Vui lòng kiểm tra lại API key trong tab Settings.")
@@ -6037,6 +7169,7 @@ with tab_veo:
                     "audioFile": None,
                     "duration": 8.0  # Mặc định Veo3 vẽ 8 giây
                 })
+            scenes = build_visual_prompts_batch(scenes, veo_voice_lang, vlog)
                 
             veo_proj["script"] = script_json
             veo_proj["scenes"] = scenes
@@ -6062,6 +7195,7 @@ with tab_veo:
                             gemini_api_key  = api_key,
                             orientation     = vid_orientation,
                             scene_text      = s["text"],
+                            veo3_prompt     = s.get("veo3_prompt", ""),
                             timeout_seconds = 200,
                             resolution      = veo_resolution_sel,
                             log_cb          = lambda msg: vlog(f"      [Veo3 SDK] {msg}")
@@ -6102,6 +7236,10 @@ with tab_veo:
                 "Vietnamese (NamMinh)": "vi-VN",
                 "Korean (SunHi)": "ko-female",
                 "Korean (InJoon)": "ko-KR",
+                "ko-KR (SunHi - Female)": "ko-female",
+                "ko-KR (InJoon - Male)": "ko-KR",
+                "Japanese (Nanami)": "ja-female",
+                "Japanese (Keita)": "ja-JP",
             }
             voice_cfg_key = _legacy_map.get(veo_voice_opt, veo_voice_opt)
             
@@ -6226,7 +7364,9 @@ with tab_veo:
                 "🎬 Gen Video",
                 type="primary",
                 use_container_width=True,
-                key="veo3_manual_gen_btn"
+                key="veo3_manual_gen_btn",
+                disabled=not (cfg.get("veo3_provider") == "api" and cfg.get("veo3_enabled", False)),
+                help="Nút này gọi Veo API và chỉ mở khi bạn bật rõ ràng chế độ dùng credit.",
             )
 
         if _manual_btn:
@@ -6286,7 +7426,12 @@ with tab_veo:
                         st.warning("Cảnh này chưa có video hoặc vẽ lỗi.")
                         
                     # Nút vẽ lại cảnh này
-                    if st.button(f"🔄 Vẽ lại Cảnh {idx+1} bằng Veo3", key=f"btn_regen_veo_{idx}"):
+                    if st.button(
+                        f"🔄 Vẽ lại Cảnh {idx+1} bằng Veo3",
+                        key=f"btn_regen_veo_{idx}",
+                        disabled=not (cfg.get("veo3_provider") == "api" and cfg.get("veo3_enabled", False)),
+                        help="Có sử dụng Veo API credit.",
+                    ):
                         st.info(f"Đang vẽ lại cảnh {idx+1}...")
                         gemini_keys = cfg.get("gemini", [])
                         veo_path = None
@@ -6297,6 +7442,7 @@ with tab_veo:
                                     gemini_api_key  = api_key,
                                     orientation     = "portrait" if "9:16" in veo_proj.get("aspect","") else "landscape",
                                     scene_text      = s["text"],
+                                    veo3_prompt     = s.get("veo3_prompt", ""),
                                     timeout_seconds = 200,
                                     resolution      = veo_proj.get("resolution","720p"),
                                     log_cb          = lambda msg: st.caption(f"SDK: {msg}")

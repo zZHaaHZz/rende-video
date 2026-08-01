@@ -58,12 +58,14 @@ CAPCUT_VOICES = {
     "🇻🇳 Hoài My (Neural)":               ("vi-VN-HoaiMyNeural",                   "7371666434650280464"),
     "🇻🇳 Nam Minh (Neural)":              ("vi-VN-NamMinhNeural",                  "7371666524727153168"),
     "🇻🇳 Mai":                            ("BV562_streaming",                      "7483736254694035984"),
-    "🇻🇳 Ban Mai":                        ("multi_female_yangguangnv_uranus_bigtts","7637456432522218773"),
-    "🇻🇳 Review Phim":                    ("multi_female_richgirl_uranus_bigtts",   "7637460351541447956"),
-    "🇻🇳 Bản Tin Nữ":                     ("multi_female_sisi_uranus_bigtts",       "7637455857285860629"),
-    "🇻🇳 Giọng Nam Trầm":                 ("multi_male_felipe_uranus_bigtts",       "7637456729696996628"),
-    "🇻🇳 Giọng Gái Mới Lớn":              ("multi_female_peiqi_uranus_bigtts",      "7637458789033151751"),
-    "🇻🇳 Nam Bản Tin":                    ("multi_female_xinwenjieshuo_uranus_bigtts","7637455039719640327"),
+    # Các alias dưới đây cố ý dùng engine vi-VN/BV native ổn định. Những ID
+    # multi_* cũ đôi lúc tự chuyển accent hoặc đọc bằng nữ English giữa video.
+    "🇻🇳 Ban Mai":                        ("BV562_streaming",                       "7483736254694035984"),
+    "🇻🇳 Review Phim":                    ("BV074_streaming",                       "7102355709945188865"),
+    "🇻🇳 Bản Tin Nữ":                     ("vi_female_huong",                       "7264854897953083905"),
+    "🇻🇳 Giọng Nam Trầm":                 ("vi-VN-NamMinhNeural",                   "7371666524727153168"),
+    "🇻🇳 Giọng Gái Mới Lớn":              ("vi-VN-HoaiMyNeural",                    "7371666434650280464"),
+    "🇻🇳 Nam Bản Tin":                    ("vi-VN-NamMinhNeural",                   "7371666524727153168"),
     "🇻🇳 Nhỏ Ngọt Ngào":                  ("BV421_vivn_streaming",                 "7252594014782755330"),
     "🇻🇳 Robot VN":                       ("BV075_streaming_robot_dsp",            "7538698409633516816"),
     # ── English ─────────────────────────────────────────────────────────
@@ -82,27 +84,18 @@ CAPCUT_VOICES = {
     "🇺🇸 Cute Girl":                      ("ICL_en_female_little_cute_dsp",        "7605129105306111233"),
     "🇺🇸 Energetic Female":               ("BV503_streaming",                      "7081168775646548482"),
     "🇺🇸 English Standard":               ("BV510_streaming",                      "7081169180120060418"),
-    # ── Korean 🇰🇷 ──────────────────────────────────────────────────────
-    "🇰🇷 여성 표준 (Standard Female)":       ("BV700_streaming",                      "7105462272342319745"),
-    "🇰🇷 남성 표준 (Standard Male)":         ("BV701_streaming",                      "7105461538601099777"),
-    "🇰🇷 여성 뉴스 앵커 (News Anchor F)":     ("BV702_streaming",                      "7105461795774119937"),
-    "🇰🇷 남성 뉴스 앵커 (News Anchor M)":    ("BV703_streaming",                      "7105461909553725953"),
-    "🇰🇷 활발한 여성 (Energetic Female)":    ("BV704_streaming",                      "7105462048789807873"),
-    "🇰🇷 차분한 남성 (Calm Male)":           ("BV705_streaming",                      "7105462157993402881"),
-    "🇰🇷 귀여운 소녀 (Cute Girl)":           ("BV706_streaming",                      "7105462385513148929"),
-    "🇰🇷 SunHi (Neural)":                  ("ko-KR-SunHiNeural",                   "7371666711682294288"),
-    "🇰🇷 InJoon (Neural Male)":            ("ko-KR-InJoonNeural",                  "7371666797977337872"),
 }
 
 # Default voices for quick language selection
 CAPCUT_VOICE_DEFAULTS = {
     "vi": "🇻🇳 Cô Gái Hoạt Ngôn (BV074)",
     "en": "🇺🇸 EN US Male",
-    "ko": "🇰🇷 여성 표준 (Standard Female)",
 }
 
-POLL_INTERVAL  = 2.0   # seconds between polls
-POLL_MAX_TRIES = 15    # max ~30s (trước là 60x3s=180s bị stuck quá lâu)
+POLL_INTERVAL = 2.0
+# CapCut thường giữ task trong queue lâu hơn 30 giây khi dự án có nhiều cảnh.
+# 120 giây vẫn có giới hạn rõ ràng nhưng tránh tạo task trùng chỉ vì queue chậm.
+POLL_TIMEOUT = 120.0
 
 
 def is_available() -> bool:
@@ -123,10 +116,16 @@ def _fresh_device() -> dict:
     return d
 
 
-def _build_tts_request(text: str, voice_type: str, resource_id: str, rate: str = "1.0"):
+def _build_tts_request(
+    text: str,
+    voice_type: str,
+    resource_id: str,
+    rate: str = "1.0",
+    lang: str = "en-US",
+):
     """Build the URL, headers and body for a TTS task creation request."""
     device = _fresh_device()
-    babi, body = tts_new_body([text], voice_type, resource_id, rate, device)
+    babi, body = tts_new_body([text], voice_type, resource_id, rate, device, lang=lang)
     path  = "/lv/v1/common_task/new"
     query = common_query(device, babi, include_region=True)
     from urllib.parse import urlencode
@@ -156,14 +155,22 @@ def _build_query_request(task_id: str, token: str):
     return url, headers, body_text
 
 
-def submit_tts_task(text: str, voice_type: str, resource_id: str, rate: str = "1.0"):
+def submit_tts_task(
+    text: str,
+    voice_type: str,
+    resource_id: str,
+    rate: str = "1.0",
+    lang: str = "en-US",
+):
     """
     Submit a TTS task to CapCut API.
     Returns (task_id, token) on success, raises on error.
     """
     if not _CC_AVAILABLE:
         raise RuntimeError(f"capcut-tts-api not available: {_CC_IMPORT_ERR}")
-    url, headers, body_text = _build_tts_request(text, voice_type, resource_id, rate)
+    url, headers, body_text = _build_tts_request(
+        text, voice_type, resource_id, rate, lang=lang
+    )
     resp = requests.post(url, headers=headers, data=body_text.encode("utf-8"), timeout=30)
     data = checked_json_response(resp, "tts-new")
     tasks = data.get("data", {}).get("tasks", [])
@@ -180,7 +187,10 @@ def poll_tts_task(task_id: str, token: str, timeout: float = 120.0):
     """
     if not _CC_AVAILABLE:
         raise RuntimeError(f"capcut-tts-api not available: {_CC_IMPORT_ERR}")
-    deadline = time.time() + timeout
+    started_at = time.time()
+    deadline = started_at + timeout
+    last_status = None
+    last_progress_log = started_at
     while time.time() < deadline:
         url, headers, body_text = _build_query_request(task_id, token)
         resp = requests.post(url, headers=headers, data=body_text.encode("utf-8"), timeout=30)
@@ -190,7 +200,13 @@ def poll_tts_task(task_id: str, token: str, timeout: float = 120.0):
             raise RuntimeError(f"TTS query: no tasks in response: {data}")
         task = tasks[0]
         status = task.get("status", "")
-        if status == "succeeded":
+        now = time.time()
+        if status != last_status or now - last_progress_log >= 20:
+            elapsed = int(now - started_at)
+            print(f"[CapCut TTS] Task {task_id}: status={status or 'unknown'} ({elapsed}s/{int(timeout)}s)")
+            last_status = status
+            last_progress_log = now
+        if status in ("succeeded", "succeed"):
             # payload is a JSON string with audio_url
             import json
             payload_raw = task.get("payload", "{}")
@@ -205,9 +221,13 @@ def poll_tts_task(task_id: str, token: str, timeout: float = 120.0):
                 if items:
                     audio_url = items[0].get("audio_url", "")
             if not audio_url:
+                subtitles = payload.get("audio_subtitles") or []
+                if subtitles:
+                    audio_url = subtitles[0].get("speech_url") or subtitles[0].get("audio_url", "")
+            if not audio_url:
                 raise RuntimeError(f"TTS succeeded but no audio_url in payload: {payload}")
             return audio_url
-        elif status in ("failed", "error"):
+        elif status in ("failed", "error", "fail"):
             raise RuntimeError(f"TTS task failed: {task}")
         # queueing / processing — wait and retry
         time.sleep(POLL_INTERVAL)
@@ -241,17 +261,25 @@ def tts_capcut(
         return None, None
 
     voice_type, resource_id = CAPCUT_VOICES.get(voice_key, ("BV074_streaming", "7102355709945188865"))
+    voice_lang = (
+        "ko-KR" if "🇰🇷" in voice_key
+        else "vi-VN" if "🇻🇳" in voice_key
+        else "ja-JP" if "🇯🇵" in voice_key
+        else "en-US"
+    )
 
     try:
         # _build_tts_request đã dùng _fresh_device() → deepcopy + randomize device IDs
         # KHÔNG mutate DEFAULT_DEVICE trực tiếp vì sẽ gây lỗi concurrent requests
 
         # 1. Submit
-        task_id, token = submit_tts_task(text, voice_type, resource_id, rate)
+        task_id, token = submit_tts_task(
+            text, voice_type, resource_id, rate, lang=voice_lang
+        )
         print(f"[CapCut TTS] Task submitted: {task_id}")
 
         # 2. Poll
-        audio_url = poll_tts_task(task_id, token, timeout=30.0)  # 30s timeout — nếu không về là lỗi
+        audio_url = poll_tts_task(task_id, token, timeout=POLL_TIMEOUT)
         print(f"[CapCut TTS] Audio ready: {audio_url[:80]}...")
 
         # 3. Download

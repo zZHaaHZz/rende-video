@@ -49,11 +49,21 @@ ORIENTATION_MAP = {
 }
 
 
-def _build_cinematic_prompt(keyword: str, scene_text: str = "") -> str:
+def _build_cinematic_prompt(
+    keyword: str,
+    scene_text: str = "",
+    veo3_prompt: str = "",
+) -> str:
     """
     Chuyển keyword + narration text → prompt Veo3 style điện ảnh.
     Veo3 phản ứng tốt với prompt mô tả cảnh quay cụ thể, không phải từ khóa search.
     """
+    # A prompt reviewed in the scene editor must win over the generic
+    # keyword/narration fallback. This keeps the actual generation aligned
+    # with what the user sees in the UI.
+    if veo3_prompt and veo3_prompt.strip():
+        return veo3_prompt.strip()
+
     base = keyword.strip()
 
     context = ""
@@ -77,6 +87,7 @@ def generate_video_veo3(
     timeout_seconds: int = 240,
     resolution: str = "720p",
     log_cb: Optional[Callable] = None,
+    veo3_prompt: str = "",
 ) -> Optional[str]:
     """
     Generate 1 video clip bằng Veo3 API (SDK).
@@ -106,7 +117,7 @@ def generate_video_veo3(
         return None
 
     aspect  = ORIENTATION_MAP.get(orientation, "16:9")
-    prompt  = _build_cinematic_prompt(keyword, scene_text)
+    prompt  = _build_cinematic_prompt(keyword, scene_text, veo3_prompt)
     log(f"🎬 Prompt: {prompt[:80]}...")
 
     client = genai.Client(
@@ -217,6 +228,7 @@ def generate_video_veo3_rest(
     timeout_seconds: int = 240,
     resolution: str = "720p",
     log_cb: Optional[Callable] = None,
+    veo3_prompt: str = "",
 ) -> Optional[str]:
     """
     Fallback dùng REST API trực tiếp (không cần google-genai SDK).
@@ -230,7 +242,7 @@ def generate_video_veo3_rest(
             log_cb(msg)
 
     aspect = ORIENTATION_MAP.get(orientation, "16:9")
-    prompt = _build_cinematic_prompt(keyword, scene_text)
+    prompt = _build_cinematic_prompt(keyword, scene_text, veo3_prompt)
     BASE   = "https://generativelanguage.googleapis.com/v1beta"
 
     for model_id in VEO_MODELS:
@@ -340,13 +352,14 @@ def generate_video_veo3_best(
     timeout_seconds: int = 240,
     resolution: str = "720p",
     log_cb: Optional[Callable] = None,
+    veo3_prompt: str = "",
 ) -> Optional[str]:
     """
     Entry point chính: thử SDK trước, fallback REST nếu SDK fail.
     """
     result = generate_video_veo3(
         keyword, gemini_api_key, orientation, scene_text,
-        timeout_seconds, resolution, log_cb
+        timeout_seconds, resolution, log_cb, veo3_prompt
     )
     if result:
         return result
@@ -355,8 +368,149 @@ def generate_video_veo3_best(
         log_cb("🔄 SDK thất bại → thử REST API...")
     return generate_video_veo3_rest(
         keyword, gemini_api_key, orientation, scene_text,
-        timeout_seconds, resolution, log_cb
+        timeout_seconds, resolution, log_cb, veo3_prompt
     )
+
+
+
+def generate_video_google_flow(
+    keyword: str,
+    token: str,
+    email: Optional[str] = None,
+    model: str = "veo-3.1-fast",
+    orientation: str = "landscape",
+    scene_text: str = "",
+    timeout_seconds: int = 240,
+    log_cb: Optional[Callable] = None,
+    veo3_prompt: str = "",
+) -> Optional[str]:
+    """
+    Tạo video bằng Google Flow thông qua UseAPI.net REST API proxy.
+    """
+    import requests
+    
+    def log(msg: str):
+        print(f"[GoogleFlow] {msg}", flush=True)
+        if callable(log_cb):
+            log_cb(msg)
+
+    aspect = ORIENTATION_MAP.get(orientation, "16:9")
+    prompt = _build_cinematic_prompt(keyword, scene_text, veo3_prompt)
+    
+    log(f"🚀 Gọi UseAPI Google Flow | model={model} | aspect={aspect}...")
+    log(f"🎬 Prompt: {prompt[:80]}...")
+    
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+    
+    payload = {
+        "prompt": prompt,
+        "model": model,
+        "aspectRatio": aspect,
+        "async": True
+    }
+    if email:
+        payload["email"] = email
+        
+    url = "https://api.useapi.net/v1/google-flow/videos"
+    
+    try:
+        r = requests.post(url, json=payload, headers=headers, timeout=30)
+        if not r.ok:
+            try:
+                err = r.json().get("error", {})
+                msg = err.get("message") or r.json().get("message") or r.text
+            except Exception:
+                msg = r.text
+            log(f"❌ UseAPI error {r.status_code}: {msg[:150]}")
+            return None
+            
+        res_data = r.json()
+        job_id = res_data.get("jobId")
+        if not job_id:
+            log(f"❌ Response thiếu jobId: {res_data}")
+            return None
+            
+        log(f"⏳ Job được tạo với ID: {job_id}. Bắt đầu poll status...")
+        
+        # ── Polling ─────────────────────────────────────────────────────
+        start_t = time.time()
+        while True:
+            elapsed = time.time() - start_t
+            if elapsed > timeout_seconds:
+                log(f"⏰ Timeout sau {timeout_seconds}s")
+                break
+                
+            time.sleep(10)
+            
+            poll_url = f"https://api.useapi.net/v1/jobs/?jobid={job_id}"
+            try:
+                poll_r = requests.get(poll_url, headers=headers, timeout=15)
+                if not poll_r.ok:
+                    log(f"  ⏳ Poll HTTP error {poll_r.status_code}, tiếp tục...")
+                    continue
+                    
+                poll_data = poll_r.json()
+                status_obj = poll_data.get("status", {})
+                status_type = status_obj.get("type") or poll_data.get("status")
+                
+                # Check if status_type is dict or string
+                if isinstance(status_type, dict):
+                    status_name = status_type.get("type", "started")
+                else:
+                    status_name = str(status_type)
+                    
+                progress = status_obj.get("progress", 0) if isinstance(status_obj, dict) else poll_data.get("progress", 0)
+                
+                log(f"  ⏳ Trạng thái: {status_name} | Tiến độ: {progress}% ({elapsed:.0f}s)")
+                
+                if status_name == "completed":
+                    media = poll_data.get("media", [])
+                    video_url = None
+                    if media and len(media) > 0:
+                        # Thử media[0].videoUrl trước
+                        video_url = media[0].get("videoUrl")
+                        if not video_url:
+                            # Thử fallback media[0].video.generatedVideo.fifeUrl
+                            video_obj = media[0].get("video", {})
+                            gen_video = video_obj.get("generatedVideo", {}) if isinstance(video_obj, dict) else {}
+                            video_url = gen_video.get("fifeUrl") or gen_video.get("downloadUrl")
+                            
+                    if video_url:
+                        log(f"  📥 Tải video: {video_url[:60]}...")
+                        dl = requests.get(video_url, timeout=60)
+                        if dl.ok and len(dl.content) > 10_000:
+                            out_path = VEO_CACHE_DIR / f"google_flow_{uuid.uuid4().hex}.mp4"
+                            out_path.write_bytes(dl.content)
+                            size_kb = len(dl.content) // 1024
+                            log(f"✅ Google Flow Video OK! {out_path.name} ({size_kb}KB)")
+                            return str(out_path)
+                        else:
+                            log(f"❌ Tải thất bại: HTTP status={dl.status_code} size={len(dl.content) if dl.ok else 0}")
+                            break
+                    else:
+                        log(f"❌ job completed nhưng không tìm thấy videoUrl/fifeUrl trong media: {media}")
+                        break
+                        
+                elif status_name == "failed":
+                    msg = status_obj.get("message") if isinstance(status_obj, dict) else poll_data.get("message", "unknown error")
+                    log(f"❌ Job thất bại: {msg}")
+                    break
+                    
+                elif status_name == "cancelled":
+                    log(f"❌ Job bị hủy")
+                    break
+                    
+            except Exception as pe:
+                log(f"  ⏳ Lỗi khi polling: {pe}")
+                
+        return None
+        
+    except Exception as e:
+        log(f"❌ UseAPI Exception: {e}")
+        return None
 
 
 def clear_veo_cache(max_files: int = 200):
