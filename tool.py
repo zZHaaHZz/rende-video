@@ -4,10 +4,24 @@ Chạy: streamlit run tool.py
 """
 import streamlit as st
 from vietnamese_tts import normalize_vietnamese_tts
+from video_config import normalize_import_video_config
 import asyncio, json, os, re, uuid, base64, subprocess, shutil, time, tempfile, random, math
 from typing import Optional
 from pathlib import Path
 import requests
+
+# ── Social publishing (Fanpage / TikTok / YouTube Shorts) ────────────────────
+try:
+    from social_publisher import PublishWorker, SocialStore
+    from social_publisher_ui import (
+        render_connection_settings,
+        render_post_render_publish,
+        render_publish_tab,
+    )
+    _SOCIAL_PUBLISHING_OK = True
+except Exception as _social_import_error:
+    _SOCIAL_PUBLISHING_OK = False
+    print(f"[social] Module not loaded: {_social_import_error}")
 
 # ── CapCut TTS ────────────────────────────────────────────────────────────────
 try:
@@ -49,6 +63,20 @@ except Exception as _creative_error:
 
 st.set_page_config(page_title="AI Video Creator", page_icon="🎬", layout="wide")
 
+@st.cache_resource
+def _get_social_runtime():
+    """One durable store + background worker per Streamlit process."""
+    store = SocialStore()
+    worker = PublishWorker(store).start()
+    return store, worker
+
+if _SOCIAL_PUBLISHING_OK:
+    try:
+        _SOCIAL_STORE, _SOCIAL_WORKER = _get_social_runtime()
+    except Exception as _social_runtime_error:
+        _SOCIAL_PUBLISHING_OK = False
+        print(f"[social] Runtime not started: {_social_runtime_error}")
+
 # Prefer ffmpeg-full (has libass/subtitles filter) over standard ffmpeg
 FFMPEG = (
     shutil.which("/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg")
@@ -60,32 +88,60 @@ TMP.mkdir(exist_ok=True)
 AUDIO_DIR = Path.home() / ".avc_audio"  # Permanent audio cache
 AUDIO_DIR.mkdir(exist_ok=True)
 
+
+def output_file_stem(name: str, fallback: str = "ai_video") -> str:
+    """Return a portable filename stem while keeping Vietnamese input usable."""
+    import unicodedata
+    candidate = Path((name or "").strip()).stem
+    candidate = unicodedata.normalize("NFD", candidate).encode("ascii", "ignore").decode("ascii")
+    candidate = re.sub(r"[^A-Za-z0-9_-]+", "_", candidate).strip("._-")
+    return candidate[:80] or fallback
+
+
+def available_output_path(directory: Path, stem: str) -> Path:
+    """Avoid silently replacing an earlier render with the same chosen name."""
+    candidate = directory / f"{stem}.mp4"
+    number = 2
+    while candidate.exists():
+        candidate = directory / f"{stem}_{number}.mp4"
+        number += 1
+    return candidate
+
 # ── Persistent settings via session_state + JSON file ────────────────────────
 CFG_FILE = Path.home() / ".avc_config.json"
 
+from secret_config import ENV_FILE, SECRET_ENV_MAP, extract_legacy_secrets, load_secrets, save_secrets
+
 def load_cfg():
     default_cfg = {
-        "gemini": [], "groq": [], "pexels": [], "pixabay": "", "openai": "",
         "used_videos": [],
         # Veo3 settings
         "veo3_enabled": False,      # Bật/tắt Veo3 generation
         "veo3_mode":    "fallback",  # "all" = mọi scene | "fallback" = chỉ khi stock không có
         "veo3_provider": "stock",   # "stock" | "gemini_web" | "api" | "google_flow"
         # Google Flow UseAPI settings
-        "useapi_token": "",
-        "useapi_email": "",
         "useapi_model": "veo-3.1-fast",
     }
+    data = dict(default_cfg)
     if CFG_FILE.exists():
         try:
             data = json.loads(CFG_FILE.read_text())
             for k, v in default_cfg.items():
                 if k not in data:
                     data[k] = v
-            return data
+            legacy_secrets = extract_legacy_secrets(data)
+            if legacy_secrets:
+                current_secrets = load_secrets()
+                for key, value in legacy_secrets.items():
+                    if not current_secrets.get(key):
+                        current_secrets[key] = value
+                save_secrets(current_secrets)
+                _atomic_json_write(CFG_FILE, data)
+                CFG_FILE.chmod(0o600)
         except (OSError, json.JSONDecodeError) as exc:
             print(f"[config] Cannot read {CFG_FILE}: {exc}")
-    return default_cfg
+    data.update(load_secrets())
+    return data
 
 def _atomic_json_write(path: Path, data, *, ensure_ascii=True):
     """Write JSON without leaving a half-written project after a crash."""
@@ -101,7 +157,9 @@ def _atomic_json_write(path: Path, data, *, ensure_ascii=True):
         tmp_path.unlink(missing_ok=True)
 
 def save_cfg(cfg):
-    _atomic_json_write(CFG_FILE, cfg)
+    save_secrets({key: cfg.get(key) for key in SECRET_ENV_MAP})
+    public_cfg = {key: value for key, value in cfg.items() if key not in SECRET_ENV_MAP}
+    _atomic_json_write(CFG_FILE, public_cfg)
     # This file contains API keys; keep it private on POSIX systems.
     try:
         CFG_FILE.chmod(0o600)
@@ -434,6 +492,7 @@ def parse_json_robust(raw: str) -> dict:
         f"parse_json_robust: all parse attempts failed. First 300 chars: {raw[:300]!r}",
         raw, 0
     )
+
 
 # ── OpenAI DALL-E 3 Thumbnail ─────────────────────────────────────────────────
 def generate_thumbnail_openai(script: dict, openai_key: str, W: int, H: int,
@@ -2544,8 +2603,8 @@ hr {
 </style>
 """, unsafe_allow_html=True)
 
-tab_main, tab_veo, tab_creative, tab_settings = st.tabs(
-    ["🎬 Pipeline", "🤖 Veo3 Studio", "🎨 Creative Studio", "⚙️ Settings"]
+tab_main, tab_veo, tab_creative, tab_publish, tab_settings = st.tabs(
+    ["🎬 Pipeline", "🤖 Veo3 Studio", "🎨 Creative Studio", "📣 Xuất bản", "⚙️ Settings"]
 )
 
 # ════════════════════════════════════════════════════════════
@@ -2553,7 +2612,13 @@ tab_main, tab_veo, tab_creative, tab_settings = st.tabs(
 # ════════════════════════════════════════════════════════════
 with tab_settings:
     st.header("⚙️ API Keys")
+    st.caption(f"API keys được lưu cục bộ trong file `{ENV_FILE}` (không commit lên Git).")
     changed = False
+
+    if _SOCIAL_PUBLISHING_OK:
+        render_connection_settings(st, _SOCIAL_STORE)
+    else:
+        st.warning("Module xuất bản chưa tải được. Xem terminal để biết lỗi cấu hình.")
 
     st.subheader("✨ Gemini Keys")
     new_g = st.text_input("Thêm Gemini key", placeholder="AIza... hoặc AQ...", type="password", key="g_in")
@@ -2805,6 +2870,24 @@ with tab_main:
 
     proj = st.session_state.proj
 
+    # An imported video_config is applied before widgets are created. Streamlit
+    # does not allow changing a widget's state after that widget rendered.
+    _pending_import_cfg = proj.pop("pending_import_video_config", None)
+    if _pending_import_cfg:
+        if _pending_import_cfg.get("topic"):
+            st.session_state[f"{new_mode}_custom_input"] = _pending_import_cfg["topic"]
+        if "total_duration" in _pending_import_cfg:
+            st.session_state[f"{new_mode}_total_duration"] = _pending_import_cfg["total_duration"]
+        if "target_seconds_per_scene" in _pending_import_cfg:
+            st.session_state[f"{new_mode}_seconds_per_scene"] = _pending_import_cfg["target_seconds_per_scene"]
+        if "subtitles" in _pending_import_cfg:
+            st.session_state[f"{new_mode}_show_subtitles"] = _pending_import_cfg["subtitles"]
+        if _pending_import_cfg.get("tts_rate"):
+            st.session_state["tts_rate_slider"] = _pending_import_cfg["tts_rate"]
+            cfg["tts_rate"] = _pending_import_cfg["tts_rate"]
+            save_cfg(cfg)
+        save_proj(proj)
+
     col_left, col_right = st.columns([1, 1.6])
 
     with col_left:
@@ -2829,10 +2912,10 @@ with tab_main:
                 key=f"{new_mode}_custom_input"
             )
         else:
-            custom = st.text_area("Hoặc nhập mô tả chi tiết (tùy chỉnh)", placeholder="Ví dụ:\nChủ đề: 한국 집값\nNội dung chính:\n- ...\nTôn màu: ...", height=150)
+            custom = st.text_area("Hoặc nhập mô tả chi tiết (tùy chỉnh)", placeholder="Ví dụ:\nChủ đề: 한국 집값\nNội dung chính:\n- ...\nTôn màu: ...", height=150, key=f"{new_mode}_custom_input")
         default_dur = 60 if new_mode in ("shorts", "veo3") else 600
-        duration = st.number_input("⏱️ Tổng thời lượng (giây)", min_value=15, max_value=18000, value=default_dur, step=30, help="Nhập thời lượng video tính bằng giây (VD: 600 = 10 phút, 1800 = 30 phút)")
-        target_sec_per_scene = st.number_input("⏳ Nhịp độ 1 cảnh (giây)", min_value=3, max_value=30, value=7, help="Tăng số này nếu muốn AI viết câu thoại dài hơn, đỡ bị vụn vặt.")
+        duration = st.number_input("⏱️ Tổng thời lượng (giây)", min_value=15, max_value=18000, value=default_dur, step=30, key=f"{new_mode}_total_duration", help="Nhập thời lượng video tính bằng giây (VD: 600 = 10 phút, 1800 = 30 phút)")
+        target_sec_per_scene = st.number_input("⏳ Nhịp độ 1 cảnh (giây)", min_value=3, max_value=30, value=7, key=f"{new_mode}_seconds_per_scene", help="Tăng số này nếu muốn AI viết câu thoại dài hơn, đỡ bị vụn vặt.")
         style = st.selectbox("🎭 Phong cách", ["educational","storytelling","listicle","documentary","motivational"])
 
         st.markdown("**🪝 Kiểu Hook (3 giây đầu)**")
@@ -3046,7 +3129,7 @@ with tab_main:
         if aspect != proj.get("aspect"):
             proj["aspect"] = aspect
             save_proj(proj)
-        show_sub = st.checkbox("💬 Thêm phụ đề (sub từng chữ)", value=True)
+        show_sub = st.checkbox("💬 Thêm phụ đề (sub từng chữ)", value=True, key=f"{new_mode}_show_subtitles")
         if show_sub:
             sub_style = st.selectbox(
                 "🎨 Style phụ đề",
@@ -3084,6 +3167,17 @@ with tab_main:
         _has_bgm = bgm_file or _bgm_local_path
         bgm_vol = st.slider("🔊 Âm lượng nhạc nền", min_value=0.01, max_value=0.5, value=0.1, step=0.01) if _has_bgm else 0.1
 
+        output_name = st.text_input(
+            "📁 Tên file video đầu ra",
+            value=proj.get("output_name", ""),
+            placeholder="Ví dụ: video_bat_dong_san_thang_8 (bỏ trống để dùng tiêu đề)",
+            key=f"{new_mode}_output_name",
+            help="Không cần gõ .mp4. Nếu tên đã tồn tại, app tự thêm _2, _3 để không ghi đè video cũ.",
+        )
+        if output_name != proj.get("output_name", ""):
+            proj["output_name"] = output_name
+            save_proj(proj)
+
         # Dimensions
         if "9:16" in aspect:
             W, H = 1080, 1920
@@ -3111,7 +3205,8 @@ with tab_main:
             _ep_sc     = max(2, round(duration / target_sec_per_scene))
             _wps_map   = {"Vietnamese": 3.8, "Korean": 2.2, "English": 2.2}
             _min_map   = {"Vietnamese": 35,  "Korean": 18,  "English": 18}
-            _wps       = _wps_map.get(lang, 2.2)
+            _base_wps  = _wps_map.get(lang, 2.2)
+            _wps       = _base_wps * float(tts_rate)
             _wpsc      = max(_min_map.get(lang, 18), round(target_sec_per_scene * _wps))
             _kw_ex     = {
                 "Korean":     '"young Korean man stressed apartment"',
@@ -3160,6 +3255,19 @@ with tab_main:
                 f"No brand-name cameras, fake resolution claims, narration or dialogue.\n\n"
                 f"=== RETURN FORMAT (ONLY valid JSON — no markdown, no explanation) ===\n"
                 f'{{\n'
+                f'  "video_config": {{\n'
+                f'    "topic": {json.dumps(_ep_topic, ensure_ascii=False)},\n'
+                f'    "language": "{lang}",\n'
+                f'    "total_duration": {duration},\n'
+                f'    "target_seconds_per_scene": {target_sec_per_scene},\n'
+                f'    "aspect_ratio": "{"9:16" if "9:16" in aspect else "16:9"}",\n'
+                f'    "tts_rate": {float(tts_rate):.1f},\n'
+                f'    "tts_speed": {float(tts_rate):.1f},\n'
+                f'    "base_words_per_second": {_base_wps:.1f},\n'
+                f'    "actual_words_per_second": {_wps:.2f},\n'
+                f'    "target_words_per_scene": {_wpsc},\n'
+                f'    "subtitles": {str(bool(show_sub)).lower()}\n'
+                f'  }},\n'
                 f'  "title": "viral title in {lang} (max 60 chars)",\n'
                 f'  "description": "SEO description in {lang} (150-200 words)",\n'
                 f'  "tags": ["tag1", "tag2", "tag3", "tag4", "tag5"],\n'
@@ -3230,6 +3338,11 @@ with tab_main:
                 else:
                     try:
                         _imp = parse_json_robust(_import_raw)
+                        _import_cfg = normalize_import_video_config(_imp.get("video_config"))
+                        _imp_topic = _import_cfg.get("topic", custom.strip() or niche)
+                        _imp_lang = _import_cfg.get("language", lang)
+                        _imp_rate = _import_cfg.get("tts_rate", str(tts_rate))
+                        _imp_target = _import_cfg.get("target_seconds_per_scene", target_sec_per_scene)
                         _imp_scenes = _imp.get("scenes", [])
                         if not _imp_scenes:
                             st.error("❌ JSON thiếu trường 'scenes' — kiểm tra lại output của ChatGPT.")
@@ -3239,27 +3352,30 @@ with tab_main:
                                 _ct = re.sub(r'\b(\w+)( \1\b)+', r'\1', _rt)
                                 _s["text"] = " ".join(_ct.split())
                                 if not _s.get("keyword"):
-                                    _s["keyword"] = niche
+                                    _s["keyword"] = _imp_topic
                                 if not _s.get("veo3_prompt"):
-                                    _s["veo3_prompt"] = f"Cảnh về {niche}, cinematic, 4K"
+                                    _s["veo3_prompt"] = f"Cảnh về {_imp_topic}, cinematic, 4K"
                             _imp_script = {
-                                "title":       _imp.get("title", custom.strip() or niche),
+                                "title":       _imp.get("title", _imp_topic),
                                 "description": _imp.get("description", ""),
                                 "tags":        _imp.get("tags", []),
+                                "video_config": _imp.get("video_config", {}),
                                 "scenes":      _imp_scenes,
                             }
                             # ── Pre-populate proj["scenes"] để edit UI hoạt động ngay ──
                             _wps_map_imp = {"Vietnamese": 3.8, "Korean": 2.2, "English": 2.2, "Japanese": 2.0}
-                            _wps_imp = _wps_map_imp.get(lang, 2.2) * float(tts_rate)
-                            _tgt_imp = float(target_sec_per_scene)
+                            _wps_imp = _wps_map_imp.get(_imp_lang, 2.2) * float(_imp_rate)
+                            _tgt_imp = float(_imp_target)
                             _imp_built_scenes = []
                             for _ii, _sc in enumerate(_imp_scenes):
                                 _txt = _sc.get("text", "")
-                                _json_dur = _sc.get("duration")
+                                # External prompt schema uses target_duration;
+                                # older exports used duration. Accept both.
+                                _json_dur = _sc.get("target_duration") or _sc.get("duration")
                                 if _json_dur and isinstance(_json_dur, (int, float)) and 3 <= float(_json_dur) <= 60:
                                     _dur = round(float(_json_dur), 1)
                                 else:
-                                    _is_korean = lang in ("Korean", "Japanese")
+                                    _is_korean = _imp_lang in ("Korean", "Japanese")
                                     if _is_korean or not any("A" <= c <= "z" for c in _txt[:20]):
                                         _dur_raw = max(len(_txt.replace(" ",""))/3.0, len(_txt.split())/max(_wps_imp,0.1))
                                     else:
@@ -3267,10 +3383,13 @@ with tab_main:
                                     _dur = round(min(max(_dur_raw + 0.4, 3.0), _tgt_imp * 1.5), 1)
                                 _imp_built_scenes.append({
                                     "id":          _sc.get("id", _ii + 1),
+                                    "section":     _sc.get("section", ""),
                                     "text":        _txt,
-                                    "keyword":     _sc.get("keyword", niche),
-                                    "veo3_prompt": _sc.get("veo3_prompt", f"Cảnh về {niche}, cinematic, 4K"),
+                                    "word_count":  _sc.get("word_count", len(_txt.split())),
+                                    "keyword":     _sc.get("keyword", _imp_topic),
+                                    "veo3_prompt": _sc.get("veo3_prompt", f"Cảnh về {_imp_topic}, cinematic, 4K"),
                                     "retention_note": _sc.get("retention_note", ""),
+                                    "estimated_tts_duration": _sc.get("estimated_tts_duration"),
                                     "videoUrl":    None,
                                     "veo3Path":    None,
                                     "imageUrl":    None,
@@ -3282,7 +3401,11 @@ with tab_main:
                             st.session_state.proj["script"] = _imp_script
                             st.session_state.proj["step"]   = 1
                             st.session_state.proj["scenes"] = _imp_built_scenes
-                            st.session_state.proj["lang"]   = lang
+                            st.session_state.proj["lang"]   = _imp_lang
+                            if _import_cfg.get("aspect"):
+                                st.session_state.proj["aspect"] = _import_cfg["aspect"]
+                            st.session_state.proj["video_config"] = _imp.get("video_config", {})
+                            st.session_state.proj["pending_import_video_config"] = _import_cfg
                             st.session_state.proj["target_sec_per_scene"] = _tgt_imp
                             _pid = st.session_state.proj.get("id", "")
                             for _ci in range(len(_imp_built_scenes) + 5):
@@ -5576,29 +5699,14 @@ with tab_main:
                     except Exception as e:
                         log(f"⚠️ Lỗi mix nhạc nền: {e}, giữ nguyên gốc.")
 
-                # Save to permanent location with proper name
+                # Use the requested output name when supplied; otherwise use the AI title.
                 title = proj.get("script", {}).get("title", "") or ""
-
-                # ── Tạo safe filename hỗ trợ Unicode (tiếng Việt, Korean, v.v.) ──
-                # Bước 1: Normalize NFD rồi encode ASCII (bỏ dấu tiếng Việt → ASCII tương đương)
-                import unicodedata as _ucd
-                _title_ascii = _ucd.normalize("NFD", title).encode("ascii", "ignore").decode("ascii")
-                # Bước 2: Chỉ giữ alphanumeric + khoảng trắng + dấu gạch
-                _title_clean = re.sub(r"[^\w\s\-]", "", _title_ascii).strip()
-                # Bước 3: Replace khoảng trắng → gạch dưới, giới hạn 60 ký tự
-                safe_name = re.sub(r"\s+", "_", _title_clean)[:60]
-                # Bước 4: Fallback nếu title rỗng hoàn toàn (ký tự đặc biệt thuần túy)
-                if not safe_name:
-                    # Dùng timestamp + 4 ký tự đầu của title gốc (transliterate thô)
-                    import time as _time_mod
-                    _ts_sfx = str(int(_time_mod.time()))[-6:]
-                    # Giữ lại ký tự chữ số ASCII trong title gốc nếu có
-                    _digits_in_title = re.sub(r"[^0-9a-zA-Z]", "", title)[:10]
-                    safe_name = f"ai_video_{_digits_in_title or _ts_sfx}"
+                safe_name = output_file_stem(proj.get("output_name", "") or title)
 
                 save_dir = Path.home() / "Desktop" / "AI_Videos"
                 save_dir.mkdir(parents=True, exist_ok=True)
-                final = save_dir / f"{safe_name}.mp4"
+                final = available_output_path(save_dir, safe_name)
+                safe_name = final.stem
                 shutil.copy(raw_final, final)
 
                 size_mb = final.stat().st_size / 1024 / 1024
@@ -6976,7 +7084,16 @@ with tab_main:
             st.info(f"📂 File lưu tại: `{final_path}`")
 
             video_bytes = final_path.read_bytes()
-            st.video(video_bytes)
+            if _SOCIAL_PUBLISHING_OK:
+                render_post_render_publish(
+                    st,
+                    _SOCIAL_STORE,
+                    str(final_path),
+                    proj.get("script", {}),
+                    key_prefix=f"pipeline_{proj.get('id', 'current')}",
+                )
+            else:
+                st.video(video_bytes)
 
             # Download button with proper .mp4 filename
             st.download_button(
@@ -6990,6 +7107,16 @@ with tab_main:
 
         elif proj.get("step",0) == 0 and not run_all:
             st.info("👈 Chọn cấu hình bên trái và bấm **Bắt Đầu Tự Động**\n\nSettings → thêm API keys trước")
+
+
+# ════════════════════════════════════════════════════════════
+# SOCIAL PUBLISHING TAB — schedules and prior rendered videos
+# ════════════════════════════════════════════════════════════
+with tab_publish:
+    if _SOCIAL_PUBLISHING_OK:
+        render_publish_tab(st, _SOCIAL_STORE)
+    else:
+        st.error("Module xuất bản chưa khởi động được. Kiểm tra terminal để xem lỗi.")
 
 
 # ════════════════════════════════════════════════════════════
@@ -7037,6 +7164,13 @@ with tab_veo:
         st.subheader("⚙️ Cấu hình Veo3")
         veo_topic = st.text_input("🎯 Chủ đề Video", value=veo_proj.get("topic", "Khám phá bí ẩn vũ trụ"), key="veo_topic_in")
         veo_desc = st.text_area("📝 Mô tả ý tưởng (tùy chọn)", value=veo_proj.get("description", ""), placeholder="Ví dụ: Kể về lỗ đen, giọng đọc huyền bí, tone màu xanh tối...", height=100, key="veo_desc_in")
+        veo_output_name = st.text_input(
+            "📁 Tên file video đầu ra",
+            value=veo_proj.get("output_name", ""),
+            placeholder="Ví dụ: bi_an_vu_tru_tap_1 (bỏ trống để dùng tiêu đề)",
+            key="veo_output_name_in",
+            help="Không cần gõ .mp4. Tên trùng sẽ tự có hậu tố _2, _3.",
+        )
         
         col_res1, col_res2 = st.columns(2)
         veo_aspect_sel = col_res1.selectbox("📐 Tỉ lệ", ["9:16 (Shorts)", "16:9 (YouTube)"], index=0, key="veo_aspect_sel")
@@ -7078,6 +7212,7 @@ with tab_veo:
         # Cập nhật thông tin vào project
         veo_proj["topic"] = veo_topic
         veo_proj["description"] = veo_desc
+        veo_proj["output_name"] = veo_output_name
         veo_proj["num_scenes"] = veo_num_scenes
         veo_proj["aspect"] = veo_aspect_sel
         veo_proj["resolution"] = veo_resolution_sel
@@ -7314,7 +7449,11 @@ with tab_veo:
                 concat_txt = work_dir / "concat.txt"
                 concat_txt.write_text("\n".join(f"file '{p}'" for p in scene_mp4s))
                 
-                final_out = Path.home() / "Desktop" / "AI_Videos" / f"veo3_{uuid.uuid4().hex[:8]}.mp4"
+                _veo_title = veo_proj.get("script", {}).get("title", "") if isinstance(veo_proj.get("script"), dict) else ""
+                final_out = available_output_path(
+                    Path.home() / "Desktop" / "AI_Videos",
+                    output_file_stem(veo_proj.get("output_name", "") or _veo_title, "veo3_video"),
+                )
                 final_out.parent.mkdir(parents=True, exist_ok=True)
                 
                 subprocess.run([
@@ -7463,7 +7602,16 @@ with tab_veo:
                 st.subheader("🎉 Video Final")
                 final_p = Path(veo_proj["finalPath"])
                 video_bytes = final_p.read_bytes()
-                st.video(video_bytes)
+                if _SOCIAL_PUBLISHING_OK:
+                    render_post_render_publish(
+                        st,
+                        _SOCIAL_STORE,
+                        str(final_p),
+                        veo_proj.get("script", {}),
+                        key_prefix="veo3_final",
+                    )
+                else:
+                    st.video(video_bytes)
                 st.download_button(
                     label="⬇️ Tải xuống Video Final",
                     data=video_bytes,

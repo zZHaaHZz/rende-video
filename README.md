@@ -1,234 +1,164 @@
-# 🎬 AI Video Creator
+# AI Video Creator
 
-Công cụ tạo video AI tự động — từ keyword → video hoàn chỉnh với voice, phụ đề, và thumbnail, tất cả chạy bằng **một giao diện Streamlit**.
+Ứng dụng Streamlit tạo video từ chủ đề hoặc kịch bản: viết nội dung bằng AI, tạo giọng đọc, tìm footage, dựng phụ đề, render MP4 và xuất bản lên mạng xã hội.
 
----
+## Tính năng
 
-## ✨ Tính Năng Chính
+- Pipeline video dài và Shorts: kịch bản → cảnh → voice → footage → phụ đề → MP4.
+- Gemini, Groq và OpenAI cho kịch bản, hình ảnh và thumbnail.
+- CapCut TTS, Edge TTS và Groq TTS.
+- Footage từ Pexels, Pixabay và Coverr.
+- Veo 3 Studio và Creative Studio cho video AI theo từng cảnh.
+- Đăng ngay hoặc đặt lịch lên Facebook Fanpage, YouTube Shorts và TikTok.
+- Lưu nhiều API key để tự động fallback khi hết quota.
 
-| Tính năng | Mô tả |
-|---|---|
-| 🤖 **Kịch bản AI** | Generate script theo cảnh với Gemini / Groq (llama-3.3-70b) |
-| 🎙️ **TTS đa giọng** | CapCut TTS (ưu tiên) → Edge TTS → Groq TTS |
-| 🎞️ **Footage CC0** | Tự động fetch video từ Pexels & Pixabay (royalty-free) |
-| 📝 **Phụ đề tự động** | SRT/ASS với word-timing, UPPERCASE TikTok style |
-| 🖼️ **Thumbnail AI** | DALL-E 3 (ưu tiên) → Gemini Imagen 3 |
-| 🎬 **Render video** | FFmpeg ghép cảnh + voice + phụ đề → MP4 |
-| 📺 **Long-form & Shorts** | Hỗ trợ video dài (main) và video ngắn (Shorts) song song |
-| 🔀 **Chống trùng footage** | Global deduplication + shuffle Pexels/Pixabay kết quả |
-| 🎨 **Creative Studio** | Làm phim ngắn, quảng cáo, UGC, mood film... → prompt Veo 3 → upload clip → tự dựng |
+## Yêu cầu
 
----
+- Python 3.9 trở lên.
+- FFmpeg có hỗ trợ `libass` để burn phụ đề.
+- Node.js chỉ cần khi sử dụng project độc lập `Auto-Create-Video/`.
 
-## 🚀 Cài Đặt & Chạy
-
-### 1. Clone project
+## Cài đặt
 
 ```bash
 git clone <repo-url>
 cd ai-video-creator
-```
 
-### 2. Tạo môi trường Python
-
-```bash
 python3 -m venv venv
-source venv/bin/activate   # macOS/Linux
-# hoặc: venv\Scripts\activate   # Windows
+source venv/bin/activate
+pip install streamlit requests cryptography edge-tts google-genai playwright
 ```
 
-### 3. Cài dependencies
+Trên macOS, cài FFmpeg bằng Homebrew:
 
 ```bash
-pip install streamlit requests edge-tts
-```
-
-> **CapCut TTS** (optional, chất lượng cao hơn): module `capcut_tts.py` đã có sẵn trong repo — không cần cài thêm package.
-
-### 4. Cài FFmpeg
-
-FFmpeg là **bắt buộc** để render video và ghép phụ đề.
-
-```bash
-# macOS (Homebrew)
 brew install ffmpeg
+```
 
-# Nếu cần libass để burn phụ đề (khuyến nghị)
+Nếu bản FFmpeg mặc định không có `libass`:
+
+```bash
 brew install ffmpeg-full
 ```
 
-> Script sẽ tự ưu tiên `/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg` nếu có.
-
-### 5. Chạy ứng dụng
+## Chạy ứng dụng
 
 ```bash
 streamlit run tool.py
 ```
 
-Mở trình duyệt tại `http://localhost:8501`.
+Sau đó mở [http://localhost:8501](http://localhost:8501).
 
----
+Các tab chính:
 
-## 🔑 Cấu Hình API Keys
+1. **Pipeline:** tạo video dài hoặc Shorts.
+2. **Veo3 Studio:** tạo clip bằng Veo 3.
+3. **Creative Studio:** xây storyboard và dựng phim theo cảnh.
+4. **Xuất bản:** duyệt, đăng ngay hoặc đặt lịch.
+5. **Settings:** quản lý API key và kết nối tài khoản mạng xã hội.
 
-Sau khi chạy app, vào tab **⚙️ Settings** để nhập API keys. Tất cả được lưu tự động vào `~/.avc_config.json`.
+## Cấu hình API key
 
-| API | Cần thiết | Mục đích | Lấy ở đâu |
-|---|---|---|---|
-| **Gemini** | Khuyến nghị | Generate kịch bản + Thumbnail Imagen | [aistudio.google.com](https://aistudio.google.com/app/apikey) |
-| **Groq** | Khuyến nghị | Generate kịch bản (fallback) + Groq TTS | [console.groq.com](https://console.groq.com/keys) |
-| **Pexels** | Khuyến nghị | Fetch footage video CC0 | [pexels.com/api](https://www.pexels.com/api/) |
-| **Pixabay** | Optional | Footage bổ sung từ Pixabay | [pixabay.com/api/docs](https://pixabay.com/api/docs/) |
-| **OpenAI** | Optional | Thumbnail DALL-E 3 (chất lượng cao hơn) | [platform.openai.com](https://platform.openai.com/api-keys) |
+Cách khuyến nghị là chạy app và nhập key trong tab **Settings**. App đọc và ghi file `.env` tại thư mục gốc của project.
 
-> **Lưu ý:** Có thể thêm nhiều Gemini key và Groq key — app sẽ tự round-robin và fallback khi quota hết.
+Có thể tạo thủ công từ file mẫu:
 
----
-
-## 📁 Cấu Trúc Project
-
-```
-ai-video-creator/
-├── tool.py                    # 🎯 App chính (Streamlit)
-├── creative_studio.py         # Module sáng tạo nội dung độc lập + dựng clip Veo 3
-├── capcut_tts.py              # Module CapCut TTS
-├── grok_video.py              # Module Grok video generation
-├── test_srt.py                # Test script cho SRT
-│
-├── capcut-tts-api/            # CapCut TTS API client (CLI)
-│   ├── capcut_common_task_client.py
-│   └── Voice.json             # Danh sách giọng CapCut
-│
-├── docs/                      # Tài liệu nội bộ
-│   ├── product-plan.md        # Kế hoạch sản phẩm & user stories
-│   └── whiteboard_animation_pipeline.md
-│
-└── .gitignore                 # Bỏ qua media, cache, env
+```bash
+cp .env.example .env
 ```
 
-### Files & Folders được tạo lúc runtime (không commit)
+Các biến được hỗ trợ:
 
-| Path | Mô tả |
+| Biến | Định dạng | Công dụng |
+|---|---|---|
+| `GEMINI_API_KEYS` | JSON array | Gemini, Imagen và Veo API |
+| `GROQ_API_KEYS` | JSON array | LLM và Groq TTS |
+| `PEXELS_API_KEYS` | JSON array | Video và ảnh Pexels |
+| `PIXABAY_API_KEY` | JSON string | Video, ảnh và nhạc Pixabay |
+| `OPENAI_API_KEY` | JSON string | OpenAI và DALL-E |
+| `USEAPI_TOKEN` | JSON string | Google Flow qua UseAPI |
+| `USEAPI_EMAIL` | JSON string | Tài khoản Google Flow tùy chọn |
+| `SOCIAL_APP_CREDENTIALS` | JSON object | Client ID/Secret Facebook, YouTube và TikTok |
+| `SOCIAL_ACCOUNT_CREDENTIALS` | JSON object | Access/refresh token của các kênh đã kết nối |
+
+Ví dụ cú pháp nằm trong [`.env.example`](.env.example). `.env` đã được Git bỏ qua và app đặt quyền file thành `600` trên hệ thống POSIX.
+
+Không commit hoặc gửi file `.env` cho người khác.
+
+## Kết nối mạng xã hội
+
+Trong **Settings**, nhập Client ID/Key, Client Secret và Redirect URI cho nền tảng cần dùng, sau đó bấm nút kết nối OAuth.
+
+Credential mạng xã hội cũng nằm trong `.env`. App tự cập nhật biến `SOCIAL_ACCOUNT_CREDENTIALS` khi OAuth cấp hoặc refresh token. Dữ liệu mới trong `~/.avc_social/social.db` chỉ giữ metadata tài khoản, lịch đăng và audit; bản mã hóa legacy được giữ làm backup cho tới khi người dùng chủ động xóa.
+
+Xem hướng dẫn chi tiết tại [`docs/social-publishing-setup.md`](docs/social-publishing-setup.md).
+
+## Dữ liệu cục bộ
+
+| Đường dẫn | Nội dung |
 |---|---|
-| `~/.avc_config.json` | API keys + lịch sử footage đã dùng |
-| `~/.avc_project.json` | Trạng thái project Main |
-| `~/.avc_project_shorts.json` | Trạng thái project Shorts |
-| `~/.avc_audio/` | Cache file audio TTS |
-| `/tmp/avc/` | File tạm trong quá trình render |
-| `~/Desktop/AI_Videos/` | Output video & thumbnail mặc định |
+| `.env` | API key của app |
+| `~/.avc_config.json` | Thiết lập không nhạy cảm và lịch sử footage |
+| `~/.avc_project.json` | Trạng thái pipeline video dài |
+| `~/.avc_project_shorts.json` | Trạng thái pipeline Shorts |
+| `~/.avc_creative_project.json` | Trạng thái Creative Studio |
+| `~/.avc_audio/` | Cache TTS |
+| `~/.avc_social/social.db` | Metadata tài khoản, lịch đăng và audit; không chứa credential thật |
+| `~/Desktop/AI_Videos/` | Video xuất ra mặc định |
 
----
+## Cấu trúc project
 
-## 🎯 Workflow Sử Dụng
-
+```text
+ai-video-creator/
+├── tool.py                 # Ứng dụng Streamlit chính
+├── secret_config.py        # Đọc, ghi và migrate API key sang .env
+├── creative_studio.py      # Storyboard và dựng video sáng tạo
+├── social_publisher.py     # OAuth, database, worker và provider publishing
+├── social_publisher_ui.py  # Giao diện kết nối và xuất bản
+├── veo3_video.py           # Tích hợp Veo 3 API
+├── capcut_tts.py           # Adapter CapCut TTS
+├── vietnamese_tts.py       # Chuẩn hóa nội dung tiếng Việt cho TTS
+├── video_config.py         # Kiểm tra cấu hình script import
+├── capcut-tts-api/         # Client CapCut TTS
+├── Auto-Create-Video/      # Pipeline TypeScript độc lập
+└── docs/                   # Spec và tài liệu thiết kế
 ```
-1. Settings  →  Nhập API keys
-2. Topics    →  Chọn chủ đề / nhập keyword
-3. Script    →  AI viết kịch bản theo cảnh
-4. Edit      →  Chỉnh sửa từng cảnh (text, keyword, duration)
-5. Build     →  Fetch footage + render video
-6. Export    →  Tải MP4 + thumbnail + metadata
-```
 
-### Chế Độ Main vs Shorts
+## Kiểm thử
 
-- **Main**: Video dài (mặc định, lưu vào `.avc_project.json`)
-- **Shorts**: Video ngắn 60s (lưu vào `.avc_project_shorts.json`)
-- Chuyển chế độ bằng nút toggle trong sidebar
+Chạy bộ unit test chính:
 
-### Creative Studio (mảng nội dung sáng tạo)
-
-Creative Studio là workflow độc lập, không dùng project hay state của
-Main/Shorts/Veo3 Studio. Giao diện được chia thành wizard 4 bước:
-
-1. **Ý tưởng:** chọn dạng nội dung, hướng kể chuyện, loại hình video (người
-   thật, hoạt hình 2D/3D, anime, claymation...), phong cách, mood và nhịp dựng.
-2. **Storyboard:** AI tạo creative direction, Character Bible và prompt từng
-   cảnh. Có thể thêm ảnh tham chiếu, chỉnh duration, khóa khung hình đầu/cuối,
-   hướng chuyển động và đổi thứ tự cảnh.
-3. **Sản xuất:** chọn Gemini Web để upload MP4 thủ công hoặc Veo API để tự tạo
-   tất cả cảnh còn thiếu. Mỗi cảnh có sound plan riêng và có thể upload
-   Foley/SFX, chỉnh âm lượng cùng thời điểm bắt đầu.
-4. **Xuất bản:** thêm nhạc, giữ audio gốc, tự động audio-ducking và ghép MP4
-   bằng timeline `xfade/acrossfade` (cut, dissolve, whip, flash, fade, match).
-   Khi hình cần loop để đủ duration, audio gốc chỉ phát một lần rồi pad silence,
-   tránh tiếng click hoặc ambience bị lặp máy móc.
-
-Project được lưu riêng tại `~/.avc_creative_project.json`; clip tại
-`~/.avc_creative_assets/`; video final tại `~/Desktop/AI_Videos/Creative_Studio/`.
-
----
-
-## 🎙️ Voices Hỗ Trợ
-
-### CapCut TTS (chất lượng cao nhất)
-Xem danh sách đầy đủ trong `capcut-tts-api/Voice.json`. Một số giọng phổ biến:
-- 🇻🇳 **Cô Gái Hoạt Ngôn** (BV074) — Tiếng Việt nữ
-- 🇻🇳 **Nam Giọng Thuyết Minh** — Tiếng Việt nam
-- 🇺🇸 **American Male** — English nam
-- 🇰🇷 **Korean Male/Female** — Tiếng Hàn
-
-### Edge TTS (fallback)
-`vi-VN-NamMinhNeural`, `vi-VN-HoaiMyNeural`, `en-US-GuyNeural`, `en-US-JennyNeural`, `ko-KR-InJoonNeural`
-
----
-
-## 🛠️ Troubleshooting
-
-### FFmpeg không tìm thấy
 ```bash
-which ffmpeg          # Kiểm tra FFmpeg có trong PATH chưa
-brew reinstall ffmpeg # macOS: cài lại
+python3 -m unittest -q \
+  test_secret_config.py \
+  test_video_config.py \
+  test_vietnamese_tts.py \
+  test_creative_studio.py \
+  test_social_publisher.py
 ```
 
-### Phụ đề không hiện trên video
-FFmpeg cần có **libass** để burn phụ đề. Cài `ffmpeg-full`:
+Kiểm tra pipeline TypeScript độc lập:
+
 ```bash
-brew install ffmpeg-full
+cd Auto-Create-Video
+npm test
+npm run typecheck
 ```
 
-### Quota Gemini / Groq hết
-- Thêm nhiều API key trong Settings — app sẽ tự fallback
-- Gemini free tier: 15 RPM / 1M TPD
-- Groq free tier: ~6K TPM (llama) / 15K TPM (gemma2)
+## Xử lý lỗi thường gặp
 
-### Footage bị trùng lặp
-Lịch sử footage được lưu trong `~/.avc_config.json` (key `used_videos`, tối đa 1000 entries). Xoá key này nếu muốn reset:
-```bash
-python3 -c "
-import json, pathlib
-p = pathlib.Path.home() / '.avc_config.json'
-cfg = json.loads(p.read_text())
-cfg['used_videos'] = []
-p.write_text(json.dumps(cfg, indent=2))
-print('Done — reset used_videos')
-"
-```
+- **Không tìm thấy FFmpeg:** chạy `which ffmpeg`, sau đó cài lại bằng Homebrew.
+- **Phụ đề không xuất hiện:** dùng bản FFmpeg có `libass`.
+- **API hết quota:** thêm key dự phòng trong Settings.
+- **Key không được nhận sau khi cập nhật:** khởi động lại tiến trình Streamlit.
+- **OAuth hết hạn:** vào Settings và kết nối lại tài khoản tương ứng.
 
----
+## Bảo mật
 
-## 📦 Dependencies
+- Không ghi API key hoặc credential vào log.
+- `.env` chỉ lưu cục bộ và không được Git theo dõi.
+- Credential mạng xã hội nằm dạng plaintext trong `.env`; file được đặt quyền `600` nhưng vẫn phải được bảo vệ như mật khẩu.
 
-```
-streamlit
-requests
-edge-tts
-```
+## Giấy phép
 
-> `ffmpeg` cần cài system-level (không qua pip).
-
-Cài một lần:
-```bash
-pip install streamlit requests edge-tts
-```
-
----
-
-## 📝 License
-
-Project này dành cho mục đích cá nhân / nội bộ.  
-Footage từ **Pexels** (CC0) và **Pixabay** (Pixabay License) — an toàn cho YouTube commercial use.
-
----
-
-*📄 Tài liệu sản phẩm chi tiết: [`docs/product-plan.md`](docs/product-plan.md)*
+Project dành cho mục đích cá nhân hoặc nội bộ. Khi xuất bản thương mại, hãy kiểm tra điều khoản hiện hành của từng nhà cung cấp AI, TTS và footage.

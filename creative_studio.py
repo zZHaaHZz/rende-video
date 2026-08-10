@@ -127,6 +127,22 @@ def _safe_name(name: str) -> str:
     return stem[-100:] or "clip.mp4"
 
 
+def _output_stem(name: str, fallback: str = "creative_video") -> str:
+    """Create a portable user-facing video name without overwriting prior work."""
+    stem = Path((name or "").strip()).stem
+    stem = re.sub(r"[^a-zA-Z0-9_-]+", "_", stem).strip("._-")
+    return stem[:80] or fallback
+
+
+def _available_output_path(directory: Path, stem: str) -> Path:
+    candidate = directory / f"{stem}.mp4"
+    suffix = 2
+    while candidate.exists():
+        candidate = directory / f"{stem}_{suffix}.mp4"
+        suffix += 1
+    return candidate
+
+
 def _project_token(project: dict) -> str:
     payload = json.dumps(project.get("brief", {}), ensure_ascii=False, sort_keys=True)
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:10]
@@ -414,6 +430,7 @@ def render_video(
     music_volume: float = 0.18,
     keep_clip_audio: bool = True,
     progress: Optional[Callable[[int, str], None]] = None,
+    output_name: str = "",
 ) -> str:
     """Normalize uploaded clips and concatenate them without touching other modules."""
     if not ffmpeg_path:
@@ -508,7 +525,10 @@ def render_video(
         raise RuntimeError(f"Ghép/chuyển cảnh lỗi: {result.stderr[-800:]}")
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    final = OUTPUT_DIR / f"creative_{uuid.uuid4().hex[:8]}.mp4"
+    final = _available_output_path(
+        OUTPUT_DIR,
+        _output_stem(output_name or project.get("concept", {}).get("title", "")),
+    )
     if music_path and Path(music_path).is_file():
         if progress:
             progress(len(scenes), "Mix nhạc nền")
@@ -999,6 +1019,16 @@ def _render_export_step(project: dict, ffmpeg_path: Optional[str]) -> None:
     a, b = st.columns(2)
     keep_audio = a.checkbox("Giữ audio gốc", value=True, key=f"creative_audio_v2_{token}")
     music_volume = b.slider("Âm lượng nhạc", 0.0, 0.5, 0.18, 0.01, key=f"creative_volume_v2_{token}")
+    output_name = st.text_input(
+        "📁 Tên file video đầu ra",
+        value=project.get("output_name", ""),
+        placeholder="Ví dụ: quang_cao_san_pham_thang_8 (bỏ trống để dùng tiêu đề)",
+        key=f"creative_output_name_{token}",
+        help="Không cần gõ .mp4. Tên trùng sẽ tự thêm _2, _3 để không ghi đè file cũ.",
+    )
+    if output_name != project.get("output_name", ""):
+        project["output_name"] = output_name
+        _commit_project(project)
     st.caption(
         "Audio gốc mỗi clip chỉ phát một lần rồi được pad silence — hình có thể loop "
         "nhưng tiếng click không bị lặp. SFX từng cảnh được sync theo offset; nhạc nền tự duck."
@@ -1014,6 +1044,7 @@ def _render_export_step(project: dict, ffmpeg_path: Optional[str]) -> None:
                 lambda step, message: bar.progress(
                     min(1.0, (step + 1) / max(1, len(project["scenes"]) + 1)), text=message
                 ),
+                output_name,
             )
             project["final_path"] = final_path
             _commit_project(project)
