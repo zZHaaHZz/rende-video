@@ -673,9 +673,18 @@ EDGE_VOICES = {
     "vi-female": "vi-VN-HoaiMyNeural",
     "ko-KR": "ko-KR-InJoonNeural",   # Male KO
     "ko-female": "ko-KR-SunHiNeural",# Female KO
+    "🇰🇷 Hyunsu Đa Ngôn Ngữ (Nam)": "ko-KR-HyunsuMultilingualNeural",
+    "🇰🇷 InJoon (Nam)": "ko-KR-InJoonNeural",
+    "🇰🇷 SunHi (Nữ)": "ko-KR-SunHiNeural",
     "ja-JP": "ja-JP-KeitaNeural",      # Male JA
     "ja-female": "ja-JP-NanamiNeural", # Female JA
 }
+
+KOREAN_EDGE_VOICES = [
+    "🇰🇷 Hyunsu Đa Ngôn Ngữ (Nam)",
+    "🇰🇷 InJoon (Nam)",
+    "🇰🇷 SunHi (Nữ)",
+]
 
 def tts_edge_with_timing(text, voice_key="en-US", audio_out=None, srt_out=None, rate="1.0"):
     """Edge TTS with word-level timing. Auto-retry khi bị rate-limit."""
@@ -743,7 +752,14 @@ def tts_edge_with_timing(text, voice_key="en-US", audio_out=None, srt_out=None, 
 
                     text_words = text.split()
                     if text_words and dur > 0:
-                        char_lens = [max(1, len(w)) for w in text_words]
+                        # CJK weight: Hangul/CJK ký tự nặng hơn ASCII khi tính timing
+                        def _cjk_w(ch):
+                            cp = ord(ch)
+                            if (0xAC00 <= cp <= 0xD7A3 or 0x1100 <= cp <= 0x11FF
+                                    or 0x4E00 <= cp <= 0x9FFF or 0x3040 <= cp <= 0x30FF):
+                                return 1.8
+                            return 1.0
+                        char_lens = [max(1.0, sum(_cjk_w(c) for c in w)) for w in text_words]
                         total_chars = sum(char_lens)
                         t = 0.0
                         for w, cl in zip(text_words, char_lens):
@@ -751,7 +767,11 @@ def tts_edge_with_timing(text, voice_key="en-US", audio_out=None, srt_out=None, 
                             words.append({"word": w, "start": t, "end": t + word_dur})
                             t += word_dur
 
-                srt = make_srt(words, group=4)
+                _is_cjk = any(
+                    0xAC00 <= ord(c) <= 0xD7A3 or 0x4E00 <= ord(c) <= 0x9FFF or 0x3040 <= ord(c) <= 0x30FF
+                    for c in text if c.strip()
+                )
+                srt = make_srt(words, group=3 if _is_cjk else 4)
                 if srt_out and srt:
                     Path(srt_out).write_text(srt, encoding="utf-8")
                 return str(audio_out), srt
@@ -854,8 +874,9 @@ def make_ass(words, W=1920, H=1080, window=4, offset_s=0.0, style_name="🟡 Tik
     fs    = 58 if W == 1080 else 34
     # Shorts (9:16, W=1080): push subtitles HIGH enough to clear YouTube UI buttons
     # (Like/Share/Comment bar + channel name occupies bottom ~250px of safe area)
+    # +10% of H=1920 (≈192px) extra margin to avoid platform UI overlaps (TikTok/Reels/Shorts)
     # Landscape: keep at 120 — no UI overlay risk
-    margv = 320 if W == 1080 else 120
+    margv = 512 if W == 1080 else 120
 
     # Style preset
     st_cfg = SUB_STYLES.get(style_name, SUB_STYLES["🟡 TikTok Yellow (Viral)"])
@@ -1082,7 +1103,7 @@ _CAPCUT_SKIP = False   # True = bỏ qua CapCut, dùng Edge TTS thẳng
 def tts(text, voice_cfg="en-US", srt_out=None, rate="1.0",
         allow_edge_fallback=True):
     """Try CapCut TTS (chunked) → Edge TTS → Groq, return audio path.
-    voice_cfg: either a CapCut display key (e.g. '🇻🇳 Cô Gái Hoạt Ngôn (BV074)')
+    voice_cfg: either a CapCut display key (e.g. '🇻🇳 Cô Gái Hoạt Ngôn')
                or a legacy Edge key (e.g. 'en-US', 'vi-VN').
     rate: speed string for CapCut TTS ('0.8'...'1.3').
     allow_edge_fallback: When False, a selected CapCut voice must succeed as-is.
@@ -1278,7 +1299,17 @@ def srt_from_audio(audio_path, text, srt_path, tts_rate="1.0"):
     # ── Phân bổ timing theo số ký tự (proportional, KHÔNG gọi asyncio/Edge TTS) ──
     # QUAN TRỌNG: srt_from_audio chạy đồng bộ — KHÔNG được tạo event loop mới
     # vì sẽ conflict với Streamlit asyncio loop và làm câm toàn bộ scene sau.
-    char_lens = [max(1, len(w)) for w in text_words]
+    #
+    # CJK weight: ký tự Hàn/Nhật/Hán khi đọc mất thời gian dài hơn ký tự Latin
+    # (mỗi syllable Hangul ≈ 1.8x thời gian 1 ký tự ASCII).
+    def _char_weight(ch):
+        cp = ord(ch)
+        if (0xAC00 <= cp <= 0xD7A3 or 0x1100 <= cp <= 0x11FF
+                or 0x4E00 <= cp <= 0x9FFF or 0x3040 <= cp <= 0x30FF):
+            return 1.8
+        return 1.0
+
+    char_lens = [max(1.0, sum(_char_weight(c) for c in w)) for w in text_words]
     total_chars = sum(char_lens)
     t, words = 0.0, []
     for w, cl in zip(text_words, char_lens):
@@ -1287,8 +1318,15 @@ def srt_from_audio(audio_path, text, srt_path, tts_rate="1.0"):
         t += wd
     print(f"[srt_from_audio] char-proportion: {len(words)} words, {dur:.2f}s total")
 
+    # Tiếng Hàn/Nhật: group=3 eojeol/line (đọ đọc hơn group=1 flash nhanh)
+    # Tiếng khác: group=4 từ/line
+    _is_cjk_lang = any(
+        0xAC00 <= ord(c) <= 0xD7A3 or 0x4E00 <= ord(c) <= 0x9FFF or 0x3040 <= ord(c) <= 0x30FF
+        for c in text if c.strip()
+    )
+    _group = 3 if _is_cjk_lang else 4
 
-    srt = make_srt(words, group=1)
+    srt = make_srt(words, group=_group)
     if srt:
         Path(srt_path).write_text(srt, encoding="utf-8")
     return dur
@@ -1936,7 +1974,17 @@ def fetch_video_with_veo3(keyword: str, orientation: str = "landscape",
         - str bắt đầu bằng "http" → URL stock footage
         - "" nếu thất bại hoàn toàn
     """
-    veo3_provider = cfg.get("veo3_provider", "stock")
+    # A project can opt into the dedicated Google Flow lane without changing
+    # the user's global/default footage provider for other projects.
+    _active_project = st.session_state.get("proj", {})
+    _project_flow = (
+        _active_project.get("video_generation_flow", "current")
+        if isinstance(_active_project, dict) else "current"
+    )
+    veo3_provider = (
+        "google_flow" if _project_flow == "google_flow_auto"
+        else cfg.get("veo3_provider", "stock")
+    )
     veo3_requested = (
         veo3_provider in ("gemini_web", "google_flow")
         or cfg.get("veo3_enabled", False)
@@ -1949,7 +1997,10 @@ def fetch_video_with_veo3(keyword: str, orientation: str = "landscape",
             or (veo3_provider == "google_flow" and bool(cfg.get("useapi_token")))
         )
     )
-    veo3_mode = "all" if force_veo3 else cfg.get("veo3_mode", "fallback")
+    veo3_mode = (
+        "all" if force_veo3 or _project_flow == "google_flow_auto"
+        else cfg.get("veo3_mode", "fallback")
+    )
     gem_keys  = cfg.get("gemini", [])
 
     if veo3_requested and veo3_provider == "gemini_web":
@@ -2025,6 +2076,80 @@ def fetch_video_with_veo3(keyword: str, orientation: str = "landscape",
             return veo_path
 
     return stock_url or ""
+
+
+def generate_scene_video_with_veo3(scene: dict, video_cfg: dict,
+                                   orientation: str = "landscape",
+                                   log_cb=None) -> str:
+    """Generate one scene from its reviewed Veo prompt and return a local MP4.
+
+    This intentionally does not mutate ``scene``. Callers can keep the current
+    visual when generation fails and only attach the new file after validating
+    that it was downloaded successfully.
+    """
+    if not _VEO3_OK:
+        raise RuntimeError("Module veo3_video chưa load được")
+
+    prompt = str(scene.get("veo3_prompt", "")).strip()
+    if not prompt:
+        raise ValueError("Cảnh chưa có veo3_prompt")
+
+    provider = video_cfg.get("veo3_provider", "stock")
+    keyword = str(scene.get("keyword", "") or scene.get("text", ""))
+    scene_text = str(scene.get("text", ""))
+
+    if provider == "google_flow":
+        token = str(video_cfg.get("useapi_token", "")).strip()
+        if not token:
+            raise ValueError("Chưa cấu hình UseAPI Token cho Google Flow")
+        result = _veo3.generate_video_google_flow(
+            keyword=keyword,
+            token=token,
+            email=video_cfg.get("useapi_email") or None,
+            model=video_cfg.get("useapi_model", "veo-3.1-fast"),
+            orientation=orientation,
+            scene_text=scene_text,
+            veo3_prompt=prompt,
+            timeout_seconds=240,
+            log_cb=log_cb,
+        )
+        return result if result and Path(result).is_file() else ""
+
+    if provider != "api" or not video_cfg.get("veo3_enabled", False):
+        raise ValueError("Hãy chọn Veo API hoặc Google Flow trong Settings")
+
+    api_keys = video_cfg.get("gemini", [])
+    if not api_keys:
+        raise ValueError("Chưa cấu hình Gemini API key")
+
+    for key_index, api_key in enumerate(api_keys):
+        if callable(log_cb):
+            log_cb(f"🔑 Thử Veo API key {key_index + 1}/{len(api_keys)}")
+        result = _veo3.generate_video_veo3_best(
+            keyword=keyword,
+            gemini_api_key=api_key,
+            orientation=orientation,
+            scene_text=scene_text,
+            veo3_prompt=prompt,
+            timeout_seconds=240,
+            resolution=video_cfg.get("veo3_resolution", "720p"),
+            log_cb=log_cb,
+        )
+        if result and Path(result).is_file():
+            return result
+    return ""
+
+
+def attach_veo3_video(scene: dict, video_path: str) -> None:
+    """Attach a generated MP4 as the scene's sole visual source."""
+    if not video_path or not Path(video_path).is_file():
+        raise ValueError("Video Veo 3 tải về không hợp lệ")
+    scene["veo3Path"] = str(video_path)
+    scene["videoUrl"] = None
+    scene["imageUrl"] = None
+    scene["customVid"] = None
+    scene["customImg"] = None
+    scene.pop("veo3Error", None)
 
 
 def fetch_stock_video(keyword, orientation="landscape", used_urls=None):
@@ -2973,26 +3098,18 @@ with tab_main:
 
         # ── Voice selector: CapCut voices if available, else Edge fallback ───
         if lang == "Korean":
-            # Voice.json hiện không có giọng CapCut Hàn hợp lệ. Các ID BV700–
-            # BV706 cũ trả TTSInvalidText, nên Korean luôn dùng Edge Neural.
-            _ko_voice_opts = [
-                "ko-KR (SunHi - Female)",
-                "ko-KR (InJoon - Male)",
-            ]
+            # Cả 9 ID CapCut Hàn cũ đều lỗi. Đây là toàn bộ voice ko-KR được
+            # Edge công bố và đã tạo audio thành công ngày 2026-08-10.
+            _ko_voice_opts = KOREAN_EDGE_VOICES
             _ko_saved = proj.get("voice_cfg_key")
-            _ko_default = "ko-KR (SunHi - Female)"
-            if _ko_saved == "ko-KR":
-                _ko_default = "ko-KR (InJoon - Male)"
+            _ko_default = _ko_saved if _ko_saved in _ko_voice_opts else "🇰🇷 SunHi (Nữ)"
             voice = st.selectbox(
                 "🔊 Giọng đọc tiếng Hàn (Edge TTS)",
                 _ko_voice_opts,
                 index=_ko_voice_opts.index(_ko_default),
                 key="voice_edge_ko",
             )
-            voice_cfg_key = {
-                "ko-KR (SunHi - Female)": "ko-female",
-                "ko-KR (InJoon - Male)": "ko-KR",
-            }[voice]
+            voice_cfg_key = voice
             if voice_cfg_key != proj.get("voice_cfg_key"):
                 proj["voice_cfg_key"] = voice_cfg_key
                 save_proj(proj)
@@ -3011,8 +3128,8 @@ with tab_main:
                 cfg["tts_rate"] = tts_rate
                 save_cfg(cfg)
             _force_edge = True
-            _allow_voice_fallback = True
-            st.info("✅ Tiếng Hàn dùng Edge Neural ổn định; không gửi tới ID CapCut Hàn bị lỗi.")
+            _allow_voice_fallback = False
+            st.info("🔒 Khóa giọng Hàn: chọn giọng nào dùng đúng giọng đó; TTS lỗi sẽ dừng render.")
         elif _CAPCUT_OK:
             _lang_flag = {"Vietnamese": "🇻🇳", "English": "🇺🇸", "Korean": "🇰🇷", "Japanese": "🇯🇵"}.get(lang, "🇺🇸")
             _lang_code  = {"Vietnamese": "vi", "English": "en", "Korean": "ko", "Japanese": "ja"}.get(lang, "en")
@@ -3278,10 +3395,12 @@ with tab_main:
                 f'      "keyword": {_kw_ex},\n'
                 f'      "duration": {target_sec_per_scene},\n'
                 f'      "veo3_prompt": "Concise English visual prompt following the canonical format",\n'
+                f'      "soundEffect": "none|whoosh|click|chime|deep_hit",\n'
                 f'      "retention_note": "why viewer stays"\n'
                 f'    }}\n'
                 f'  ]\n'
                 f'}}\n\n'
+                f"soundEffect rules: \"whoosh\" = fast scene transition; \"click\" = slide/reveal; \"chime\" = positive/warm; \"deep_hit\" = shocking/tense; \"none\" = neutral/default. Pick the best match per scene mood.\n"
                 f"Write EXACTLY {_ep_sc} scenes (id 1 to {_ep_sc}). Each narration ~{_wpsc} words.\n"
                 f"Set \"duration\" = reading time in seconds (word_count / {round(_wps, 1):.1f} wps, min 3s, max {round(target_sec_per_scene * 1.5):.0f}s).\n"
                 f"Return ONLY the JSON."
@@ -3372,7 +3491,7 @@ with tab_main:
                                 # External prompt schema uses target_duration;
                                 # older exports used duration. Accept both.
                                 _json_dur = _sc.get("target_duration") or _sc.get("duration")
-                                if _json_dur and isinstance(_json_dur, (int, float)) and 3 <= float(_json_dur) <= 60:
+                                if _json_dur and isinstance(_json_dur, (int, float)) and 1 <= float(_json_dur) <= 60:
                                     _dur = round(float(_json_dur), 1)
                                 else:
                                     _is_korean = _imp_lang in ("Korean", "Japanese")
@@ -3388,6 +3507,7 @@ with tab_main:
                                     "word_count":  _sc.get("word_count", len(_txt.split())),
                                     "keyword":     _sc.get("keyword", _imp_topic),
                                     "veo3_prompt": _sc.get("veo3_prompt", f"Cảnh về {_imp_topic}, cinematic, 4K"),
+                                    "soundEffect": _sc.get("soundEffect", "none") if _sc.get("soundEffect") in ("none", "whoosh", "click", "chime", "deep_hit") else "none",
                                     "retention_note": _sc.get("retention_note", ""),
                                     "estimated_tts_duration": _sc.get("estimated_tts_duration"),
                                     "videoUrl":    None,
@@ -4486,7 +4606,7 @@ with tab_main:
                             format_str = (
                                 f'{{"title":"viral title in {lang} (max 60 chars, curiosity-driven)","description":"SEO description in {lang}",'\
                                 f'"tags":["t1","t2"],"scenes":[{{"id":1,"text":"narration STRICTLY in {lang}",'\
-                                f'"keyword":{kw_example},"retention_note":"why viewer stays"}}]}}'
+                                f'"keyword":{kw_example},"soundEffect":"none|whoosh|click|chime|deep_hit","retention_note":"why viewer stays"}}]}}'
                             )
                         else:
                             end_note = ("FINAL BATCH — close all loops, deliver the payoff, apply CTA." if is_last else "Keep 1 open loop at the end to pull viewer to the next scene.")
@@ -4500,7 +4620,7 @@ with tab_main:
                             )
                             format_str = (
                                 f'{{"scenes":[{{"id":{batch_start},"text":"narration STRICTLY in {lang}",'\
-                                f'"keyword":{kw_example},"retention_note":"why viewer stays"}}]}}'
+                                f'"keyword":{kw_example},"soundEffect":"none|whoosh|click|chime|deep_hit","retention_note":"why viewer stays"}}]}}'
                             )
 
                         if lang == "Vietnamese":
@@ -4826,9 +4946,10 @@ with tab_main:
                             "id":          sc_data["id"],
                             "text":        sc_data["text"],
                             "keyword":     sc_data["keyword"],
-                            "veo3_prompt": sc_data.get("veo3_prompt", ""),  # ← prompt AI gen sẵn từ kịch bản
+                            "veo3_prompt": sc_data.get("veo3_prompt", ""),
+                            "soundEffect": sc_data.get("soundEffect", "none") if sc_data.get("soundEffect") in ("none", "whoosh", "click", "chime", "deep_hit") else "none",
                             "videoUrl":    vid_url,
-                            "veo3Path":    veo3_path,    # ← local path nếu dùng Veo3
+                            "veo3Path":    veo3_path,
                             "imageUrl":    img_url,
                             "audioDone":   False,
                             "targetDur":   float(target_sec_per_scene),
@@ -4881,6 +5002,7 @@ with tab_main:
                                 "text":        _scene_text,
                                 "keyword":     sc_data.get("keyword", niche),
                                 "veo3_prompt": sc_data.get("veo3_prompt", ""),
+                                "soundEffect": sc_data.get("soundEffect", "none") if sc_data.get("soundEffect") in ("none", "whoosh", "click", "chime", "deep_hit") else "none",
                                 "videoUrl":    None,
                                 "veo3Path":    None,
                                 "imageUrl":    None,
@@ -5079,7 +5201,7 @@ with tab_main:
                                     _duration_label = f"{actual_dur:.1f}s" if actual_dur is not None else "chưa đo được duration"
                                     log(f"  ✅ Retry Edge TTS cảnh {i+1} thành công ({_duration_label})")
                                 else:
-                                    log(f"  ❌ CẢNH {i+1}: tất cả provider TTS đều thất bại — cảnh này sẽ dùng silence!")
+                                    log(f"  ❌ CẢNH {i+1}: tất cả provider TTS đều thất bại — render sẽ bị chặn!")
                                     log(f"     → Nguyên nhân có thể: rate limit CapCut, asyncio conflict, hoặc mất mạng")
                                     log(f"     → Chạy Render lại: cảnh đã thành công dùng cache, chỉ cảnh lỗi được tạo lại")
                             else:
@@ -5106,7 +5228,7 @@ with tab_main:
                             scenes[i]["ttsStatus"] = "error"
                             scenes[i]["ttsError"] = "Không provider TTS nào trả về audio hợp lệ"
                             _consecutive_tts_failures += 1
-                            log(f"  ❌ TTS cảnh {i+1} THẤT BẠI hoàn toàn — video sẽ dùng silence, không dùng nhầm audio cũ.")
+                            log(f"  ❌ TTS cảnh {i+1} THẤT BẠI hoàn toàn — render sẽ bị chặn, không dùng nhầm audio cũ.")
                         # Preserve srtFile: chỉ cập nhật khi có file mới, giữ lại nếu đã có từ lần trước
                         if srt_path.exists() and srt_path.stat().st_size > 0:
                             scenes[i]["srtFile"] = str(srt_path)
@@ -5126,34 +5248,42 @@ with tab_main:
                         if tts_succeeded:
                             log(f"  ✅ Audio cảnh {i+1}: đọc {aud_dur:.1f}s | target {target_dur:.0f}s → scene {final_dur:.1f}s" + (" + sub" if scenes[i].get('srtFile') else ""))
                         else:
-                            log(f"  ⚪ Cảnh {i+1}: silence {final_dur:.1f}s; {aud_dur:.1f}s chỉ là ước lượng nhịp, KHÔNG phải audio.")
+                            log(f"  ⛔ Cảnh {i+1}: chưa có audio; render sẽ bị chặn.")
 
                         # Lưu tiến độ sau từng cảnh để lần chạy sau tiếp tục đúng
                         # từ cache, kể cả khi CapCut rate-limit giữa một dự án dài.
                         proj.update({"scenes": scenes, "step": 3})
                         save_proj(proj)
 
-                        # Với chế độ giữ nguyên giọng, nhiều lỗi liên tiếp gần như
-                        # chắc chắn là provider đang rate-limit. Dừng batch ngay,
-                        # không phí hàng chục phút và tuyệt đối không render silence.
+                        # Chế độ khóa giọng phải dừng ngay từ cảnh lỗi đầu tiên.
                         if (
                             not _allow_voice_fallback
-                            and not _force_edge
-                            and _consecutive_tts_failures >= 2
+                            and _consecutive_tts_failures >= 1
                         ):
                             _tts_batch_aborted = True
                             _tts_abort_scene = i + 1
-                            log("  🛑 CapCut lỗi 2 cảnh liên tiếp — dừng batch TTS để bảo vệ giọng đã chọn.")
-                            log("     Các cảnh thành công đã được lưu cache. Chờ 1–2 phút rồi bấm Render lại để tiếp tục.")
+                            log("  🛑 TTS lỗi — dừng ngay để bảo vệ đúng giọng đã chọn và không render cảnh im lặng.")
+                            log("     Các cảnh thành công đã được lưu cache; bấm Render lại để thử lại cảnh lỗi.")
                             break
                     proj.update({"scenes": scenes, "step": 3})
                     save_proj(proj)
 
                     if _tts_batch_aborted:
                         st.error(
-                            f"CapCut đang giới hạn yêu cầu tại cảnh {_tts_abort_scene}. "
+                            f"Giọng '{voice_cfg_key}' không tạo được audio cho cảnh {_tts_abort_scene}. "
                             "Đã dừng trước khi render để video không có cảnh im lặng. "
-                            "Các cảnh thành công đã lưu; chờ 1–2 phút rồi bấm Render lại."
+                            "Các cảnh thành công đã lưu; hãy bấm Render lại để thử tiếp."
+                        )
+                        st.stop()
+
+                    _missing_audio_scenes = [
+                        i + 1 for i, scene in enumerate(scenes)
+                        if not is_valid_audio(scene.get("audioFile"))
+                    ]
+                    if _missing_audio_scenes:
+                        st.error(
+                            "Không render vì các cảnh sau chưa có giọng đọc hợp lệ: "
+                            + ", ".join(map(str, _missing_audio_scenes))
                         )
                         st.stop()
 
@@ -5279,7 +5409,9 @@ with tab_main:
                                         scenes[i]["srtFile"] = str(_inline_srt)
                                     log(f"  ✅ Re-TTS cảnh {i+1} thành công ({src_audio.name})")
                                 else:
-                                    log(f"  ❌ Cảnh {i+1}: TTS thất bại hoàn toàn — cảnh này sẽ im lặng!")
+                                    log(f"  ❌ Cảnh {i+1}: TTS thất bại hoàn toàn — dừng render, không tạo silence.")
+                                    st.error(f"Cảnh {i+1} chưa có giọng đọc hợp lệ. Đã dừng render.")
+                                    st.stop()
                     stored_dur = float(s.get("duration") or 5)
                     dur = stored_dur  # fallback
 
@@ -5313,9 +5445,8 @@ with tab_main:
                                "-t", str(dur),
                                "-c:a", "aac", "-ar", "44100", "-ac", "2", "-b:a", "128k", "-y", str(audio_path))
                     else:
-                        ffmpeg("-f","lavfi","-i","anullsrc=r=44100:cl=stereo",
-                               "-t",str(dur),
-                               "-c:a","aac", "-ar", "44100", "-ac", "2", "-b:a","128k","-y",str(audio_path))
+                        st.error(f"Cảnh {i+1} không có audio nguồn. Đã dừng render.")
+                        st.stop()
 
 
                     # Visual background: ảnh hoặc video
@@ -5546,20 +5677,10 @@ with tab_main:
                                  "-shortest", "-y", str(base_out)]
                             )
                         else:
-                            # KHÔNG dùng -an vì sẽ phá concat audio stream!
-                            # Luôn tạo silence track để concat nhất quán
-                            ffmpeg_cmd = (
-                                vid_input_args +
-                                ["-f", "lavfi", "-i", f"anullsrc=r=44100:cl=stereo",
-                                 "-vf", scale_crop,
-                                 "-t", str(dur),
-                                 "-c:v", "libx264", "-preset", "fast", "-crf", "22",
-                                 "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
-                                 "-map", "0:v", "-map", "1:a",
-                                 "-shortest", "-y", str(base_out)]
-                            )
+                            st.error(f"Cảnh {i+1} mất audio đã chuẩn hóa. Đã dừng render.")
+                            st.stop()
                     else:
-                        # Nền đen + audio (hoặc silence nếu TTS fail)
+                        # Nền đen vẫn bắt buộc phải có audio thuyết minh.
                         color_src = f"color=c=1a1d27:s={W}x{H}:r=30"
                         if audio_path.exists():
                             ffmpeg_cmd = [
@@ -5572,16 +5693,8 @@ with tab_main:
                                 "-shortest", "-y", str(base_out)
                             ]
                         else:
-                            # Luôn tạo silence thay vì -an
-                            ffmpeg_cmd = [
-                                "-f", "lavfi", "-i", color_src,
-                                "-f", "lavfi", "-i", f"anullsrc=r=44100:cl=stereo",
-                                "-t", str(dur),
-                                "-c:v", "libx264", "-preset", "fast", "-crf", "22",
-                                "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
-                                "-map", "0:v", "-map", "1:a",
-                                "-shortest", "-y", str(base_out)
-                            ]
+                            st.error(f"Cảnh {i+1} mất audio đã chuẩn hóa. Đã dừng render.")
+                            st.stop()
 
                     # ── Tính fade filter string ──
                     _fade_str = f",fade=t=in:st=0:d=0.15,fade=t=out:st={max(0.0, dur-0.15):.3f}:d=0.15" if enable_transition else ""
@@ -5857,6 +5970,93 @@ with tab_main:
                     st.progress(completed_count / total_scenes)
                 with col_prog2:
                     st.markdown(f"🏆 **Đã duyệt: {completed_count}/{total_scenes}**")
+
+                _flow_options = ["current", "google_flow_auto"]
+                _saved_flow = proj.get("video_generation_flow", "current")
+                if _saved_flow not in _flow_options:
+                    _saved_flow = "current"
+                _production_flow = st.radio(
+                    "🎬 Chọn luồng tạo hình ảnh/video cho project này",
+                    options=_flow_options,
+                    index=_flow_options.index(_saved_flow),
+                    format_func=lambda value: {
+                        "current": "Luồng hiện tại — stock / ảnh AI / upload thủ công",
+                        "google_flow_auto": "Google Flow tự động — prompt → video → đúng cảnh",
+                    }[value],
+                    horizontal=True,
+                    key="project_video_generation_flow",
+                )
+                if _production_flow != proj.get("video_generation_flow"):
+                    proj["video_generation_flow"] = _production_flow
+                    save_proj(proj)
+
+                _flow_cfg = dict(cfg)
+                if _production_flow == "google_flow_auto":
+                    _flow_cfg["veo3_provider"] = "google_flow"
+                    _flow_cfg["veo3_enabled"] = True
+                _veo_auto_ready = (
+                    _production_flow == "google_flow_auto"
+                    and _VEO3_OK
+                    and bool(_flow_cfg.get("useapi_token"))
+                )
+                _prompted_scenes = [
+                    (scene_index, candidate)
+                    for scene_index, candidate in enumerate(scenes)
+                    if str(candidate.get("veo3_prompt", "")).strip()
+                ]
+                _missing_prompt_count = total_scenes - len(_prompted_scenes)
+                if _production_flow == "google_flow_auto":
+                    st.markdown("#### 🤖 Google Flow tự động")
+                    st.caption(
+                        f"Sẵn sàng tạo {len(_prompted_scenes)}/{total_scenes} cảnh có prompt. "
+                        "Flow credit chỉ được dùng khi bạn bấm nút bên dưới hoặc chạy toàn pipeline."
+                    )
+                    if _missing_prompt_count:
+                        st.warning(f"Còn {_missing_prompt_count} cảnh chưa có veo3_prompt nên sẽ được bỏ qua.")
+                else:
+                    st.info(
+                        "Đang dùng luồng hiện tại. Stock, ảnh AI, upload và các visual đang có "
+                        "được giữ nguyên; Google Flow sẽ không tự chạy."
+                    )
+
+                if _production_flow == "google_flow_auto" and st.button(
+                    "⚡ Google Flow: tạo và gắn vào TẤT CẢ cảnh",
+                    key="generate_all_reviewed_google_flow_scenes",
+                    type="primary",
+                    use_container_width=True,
+                    disabled=not _veo_auto_ready or not _prompted_scenes,
+                    help="Sẽ dùng Flow credit. Visual hiện tại chỉ bị thay khi MP4 mới tải thành công.",
+                ):
+                    _orientation = "portrait" if "9:16" in str(proj.get("aspect", "")) else "landscape"
+                    _progress = st.progress(0, text="Chuẩn bị tạo Veo 3...")
+                    _success_count = 0
+                    _failed_scenes = []
+                    for _position, (_scene_index, _candidate) in enumerate(_prompted_scenes):
+                        _progress.progress(
+                            _position / max(1, len(_prompted_scenes)),
+                            text=f"Đang tạo cảnh {_scene_index + 1}/{total_scenes}...",
+                        )
+                        try:
+                            _path = generate_scene_video_with_veo3(
+                                _candidate, _flow_cfg, orientation=_orientation
+                            )
+                            if not _path:
+                                raise RuntimeError("Veo 3 không trả về video")
+                            attach_veo3_video(proj["scenes"][_scene_index], _path)
+                            _success_count += 1
+                        except Exception as _veo_exc:
+                            proj["scenes"][_scene_index]["veo3Error"] = str(_veo_exc)[:300]
+                            _failed_scenes.append(_scene_index + 1)
+                        save_proj(proj)
+                    _progress.progress(1.0, text=f"Hoàn tất: {_success_count}/{len(_prompted_scenes)} cảnh")
+                    if _failed_scenes:
+                        st.error("Không tạo được cảnh: " + ", ".join(map(str, _failed_scenes)))
+                    else:
+                        st.success("Đã tạo bằng Google Flow và gắn video vào đúng tất cả cảnh.")
+                    st.rerun(scope="fragment")
+
+                if _production_flow == "google_flow_auto" and not _veo_auto_ready:
+                    st.warning("Vào Settings → Google Flow và nhập UseAPI token để bật luồng tự động.")
                 # Global region preference
                 proj_region = proj.get("region", "Châu Á / Việt Nam")
                 region_options = ["Không giới hạn", "Châu Á / Việt Nam", "Phương Tây (Western)"]
@@ -5882,11 +6082,17 @@ with tab_main:
                     st.session_state.view_mode = proj.get("view_mode", "Tập trung (Mượt nhất)")
 
                 def go_prev_scene(curr):
+                    # Xóa widget cache cảnh hiện tại để cảnh mới render lại từ proj data
+                    for _k in [f"veo3_{curr}", f"text_{curr}"]:
+                        st.session_state.pop(_k, None)
                     st.session_state.selectbox_scene_active = curr - 1
                     proj["active_scene_idx"] = curr - 1
                     save_proj(proj)
 
                 def go_next_scene(curr):
+                    # Xóa widget cache cảnh hiện tại để cảnh mới render lại từ proj data
+                    for _k in [f"veo3_{curr}", f"text_{curr}"]:
+                        st.session_state.pop(_k, None)
                     st.session_state.selectbox_scene_active = curr + 1
                     proj["active_scene_idx"] = curr + 1
                     save_proj(proj)
@@ -5917,6 +6123,10 @@ with tab_main:
                         key="selectbox_scene_active"
                     )
                     if active_idx != proj.get("active_scene_idx"):
+                        # Chuyển cảnh qua selectbox: xóa widget cache cảnh cũ để render lại từ proj
+                        _old_idx = proj.get("active_scene_idx", 0)
+                        for _k in [f"veo3_{_old_idx}", f"text_{_old_idx}"]:
+                            st.session_state.pop(_k, None)
                         proj["active_scene_idx"] = active_idx
                         save_proj(proj)
                     scenes_to_render.append((active_idx, scenes[active_idx]))
@@ -5981,7 +6191,7 @@ with tab_main:
                             # ── Veo3 Prompt output: nổi bật để dễ copy gen tay ──
                             st.markdown("**🤖 Veo3 / Sora / Kling Prompt — Copy để gen video thủ công:**")
                             veo3_prompt = scene.get('veo3_prompt', '')
-                            _veo_col1, _veo_col2 = st.columns([5, 1])
+                            _veo_col1, _veo_col2, _veo_col3 = st.columns([5, 1, 1])
                             with _veo_col1:
                                 new_veo3 = st.text_area(
                                     "veo3_prompt_label",
@@ -6023,9 +6233,38 @@ with tab_main:
                                             if _res:
                                                 proj["scenes"][idx]["veo3_prompt"] = _res
                                                 save_proj(proj)
+                                                # Xoá widget cache để text_area render lại với giá trị mới
+                                                st.session_state.pop(f"veo3_{idx}", None)
                                                 st.rerun(scope="fragment")
                                         except Exception as e:
                                             st.error(f"Lỗi: {e}")
+                            with _veo_col3:
+                                if st.button(
+                                    "🎬 Tạo\nFlow",
+                                    key=f"generate_veo_scene_{idx}",
+                                    use_container_width=True,
+                                    disabled=not _veo_auto_ready or not bool(str(new_veo3).strip()),
+                                    help="Google Flow tạo video từ prompt đang duyệt và tự gắn vào cảnh này.",
+                                ):
+                                    _orientation = "portrait" if "9:16" in str(proj.get("aspect", "")) else "landscape"
+                                    try:
+                                        # Use the widget's latest value even before the normal
+                                        # fragment save at the bottom of this render pass.
+                                        proj["scenes"][idx]["veo3_prompt"] = str(new_veo3).strip()
+                                        with st.spinner(f"Veo 3 đang tạo cảnh {idx + 1}..."):
+                                            _path = generate_scene_video_with_veo3(
+                                                proj["scenes"][idx], _flow_cfg, orientation=_orientation
+                                            )
+                                        if not _path:
+                                            raise RuntimeError("Veo 3 không trả về video")
+                                        attach_veo3_video(proj["scenes"][idx], _path)
+                                        save_proj(proj)
+                                        st.success(f"Đã gắn video Google Flow vào cảnh {idx + 1}")
+                                        st.rerun(scope="fragment")
+                                    except Exception as _veo_exc:
+                                        proj["scenes"][idx]["veo3Error"] = str(_veo_exc)[:300]
+                                        save_proj(proj)
+                                        st.error(f"Veo 3 lỗi: {_veo_exc}")
 
                             # Gemini Web mode: use the user's existing Google AI
                             # subscription with an explicit human confirmation,
@@ -6620,6 +6859,14 @@ with tab_main:
                                     st.rerun(scope="fragment")
                                 has_any_video = True
 
+                            elif scene.get("veo3Path") and Path(scene["veo3Path"]).is_file():
+                                st.success("🤖 Video được tạo bằng Veo 3")
+                                st.video(scene["veo3Path"])
+                                if st.button("Xóa video Veo 3", key=f"del_veo3_{idx}"):
+                                    proj["scenes"][idx]["veo3Path"] = None
+                                    edited = True
+                                    st.rerun(scope="fragment")
+                                has_any_video = True
                             elif scene.get("videoUrl"):
                                 st.success("🔗 Đã liên kết Video Stock")
                                 st.video(scene.get("videoUrl"))
@@ -6630,6 +6877,8 @@ with tab_main:
                                 has_any_video = True
                             else:
                                 st.warning("⚠️ Chưa chọn nền")
+                                if scene.get("veo3Error"):
+                                    st.error(f"Lần tạo Veo gần nhất lỗi: {scene['veo3Error']}")
                                 # Gợi ý nhẹ về loại footage mặc định
                                 _use_ai_right = st.session_state.get("use_ai_images_confirm",
                                                st.session_state.get("use_ai_images_main", True))
@@ -6795,6 +7044,13 @@ with tab_main:
                                         if _audio_file_r and Path(_audio_file_r).exists():
                                             _src_audio_r = Path(_audio_file_r)
 
+                                        if not is_valid_audio(_src_audio_r):
+                                            st.error(
+                                                f"Cảnh {idx+1} chưa có giọng đọc hợp lệ. "
+                                                "Hãy tạo lại TTS trước khi render cảnh này."
+                                            )
+                                            st.stop()
+
                                         # Duration
                                         _dur_r = float(_s.get("duration") or 5.0)
                                         if _src_audio_r:
@@ -6823,9 +7079,8 @@ with tab_main:
                                                    "-c:a", "aac", "-ar", "44100", "-ac", "2", "-b:a", "128k",
                                                    "-y", str(_audio_trim_r))
                                         else:
-                                            ffmpeg("-f","lavfi","-i","anullsrc=r=44100:cl=stereo",
-                                                   "-t",str(_dur_r),"-c:a","aac","-ar","44100","-ac","2",
-                                                   "-b:a","128k","-y",str(_audio_trim_r))
+                                            st.error(f"Cảnh {idx+1} không có audio nguồn. Đã dừng render.")
+                                            st.stop()
 
                                         # Visual source
                                         _vid_r = _s_dir_r / "video.mp4"
@@ -7183,7 +7438,7 @@ with tab_veo:
         if veo_voice_lang == "Korean":
             veo_voice_opt = st.selectbox(
                 "🔊 Giọng đọc tiếng Hàn (Edge TTS)",
-                ["ko-KR (SunHi - Female)", "ko-KR (InJoon - Male)"],
+                KOREAN_EDGE_VOICES,
                 key="veo_voice_opt_ko",
             )
         elif _CAPCUT_OK:
@@ -7385,8 +7640,12 @@ with tab_veo:
                 audio_path = AUDIO_DIR / f"veo_s{h}.mp3"
                 srt_path   = AUDIO_DIR / f"veo_s{h}.srt"
                 
-                result = tts(s["text"], voice_cfg_key, rate=veo_tts_rate)
-                if result:
+                scenes[i].pop("audioFile", None)
+                result = tts(
+                    s["text"], voice_cfg_key, rate=veo_tts_rate,
+                    allow_edge_fallback=False,
+                )
+                if result and is_valid_audio(result):
                     shutil.copy(result, audio_path)
                     scenes[i]["audioFile"] = str(audio_path)
                     try:
@@ -7401,11 +7660,25 @@ with tab_veo:
                     except Exception:
                         pass
                 else:
-                    vlog(f"  ⚠️ Cảnh {i+1}: TTS lỗi, dùng âm thanh im lặng")
+                    scenes[i]["ttsStatus"] = "error"
+                    scenes[i]["ttsError"] = f"Giọng {voice_cfg_key} không trả về audio hợp lệ"
+                    vlog(f"  ❌ Cảnh {i+1}: TTS lỗi — dừng, không render âm thanh im lặng")
+                    break
                     
             veo_proj["scenes"] = scenes
             veo_proj["step"] = 3
             save_veo_proj(veo_proj)
+
+            _veo_missing_audio = [
+                i + 1 for i, scene in enumerate(scenes)
+                if not is_valid_audio(scene.get("audioFile"))
+            ]
+            if _veo_missing_audio:
+                status_box.error(
+                    "Đã dừng trước khi render. Cảnh chưa có giọng đọc hợp lệ: "
+                    + ", ".join(map(str, _veo_missing_audio))
+                )
+                st.stop()
             
             # --- BƯỚC 4: RENDER GHÉP VIDEO ---
             status_box.info("🎞️ Đang render video cuối...")
@@ -7425,6 +7698,10 @@ with tab_veo:
                 vid_in = s["veo3Path"]
                 aud_in = s["audioFile"]
                 dur = s["duration"]
+
+                if not is_valid_audio(aud_in):
+                    status_box.error(f"Cảnh {i+1} mất audio trước khi render. Đã dừng.")
+                    st.stop()
                 
                 out_scene = s_dir / "scene_output.mp4"
                 
@@ -7434,12 +7711,6 @@ with tab_veo:
                         "-filter_complex", f"[0:v]fps=30,scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},loop=loop=-1:size=240:start=0[v]",
                         "-map", "[v]", "-map", "1:a", "-c:v", "libx264", "-c:a", "aac", "-ar", "44100", "-ac", "2",
                         "-t", str(dur), "-y", str(out_scene)
-                    ]
-                else:
-                    ffmpeg_cmd = [
-                        FFMPEG, "-i", str(vid_in),
-                        "-filter_complex", f"[0:v]fps=30,scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},loop=loop=-1:size=240:start=0[v]",
-                        "-map", "[v]", "-c:v", "libx264", "-t", str(dur), "-y", str(out_scene)
                     ]
                 subprocess.run(ffmpeg_cmd, capture_output=True)
                 if out_scene.exists():

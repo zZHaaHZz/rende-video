@@ -52,22 +52,30 @@ except ImportError as _e:
 # ── Vietnamese, English & Korean voices from Voice.json (curated subset) ───────
 CAPCUT_VOICES = {
     # ── Vietnamese ──────────────────────────────────────────────────────
-    "🇻🇳 Cô Gái Hoạt Ngôn (BV074)":      ("BV074_streaming",                      "7102355709945188865"),
-    "🇻🇳 Thanh Niên Tự Tin (BV075)":      ("BV075_streaming",                      "7102355803792740865"),
-    "🇻🇳 Giọng Nữ Phổ Thông":             ("vi_female_huong",                      "7264854897953083905"),
-    "🇻🇳 Hoài My (Neural)":               ("vi-VN-HoaiMyNeural",                   "7371666434650280464"),
-    "🇻🇳 Nam Minh (Neural)":              ("vi-VN-NamMinhNeural",                  "7371666524727153168"),
-    "🇻🇳 Mai":                            ("BV562_streaming",                      "7483736254694035984"),
-    # Các alias dưới đây cố ý dùng engine vi-VN/BV native ổn định. Những ID
-    # multi_* cũ đôi lúc tự chuyển accent hoặc đọc bằng nữ English giữa video.
-    "🇻🇳 Ban Mai":                        ("BV562_streaming",                       "7483736254694035984"),
-    "🇻🇳 Review Phim":                    ("BV074_streaming",                       "7102355709945188865"),
-    "🇻🇳 Bản Tin Nữ":                     ("vi_female_huong",                       "7264854897953083905"),
-    "🇻🇳 Giọng Nam Trầm":                 ("vi-VN-NamMinhNeural",                   "7371666524727153168"),
-    "🇻🇳 Giọng Gái Mới Lớn":              ("vi-VN-HoaiMyNeural",                    "7371666434650280464"),
-    "🇻🇳 Nam Bản Tin":                    ("vi-VN-NamMinhNeural",                   "7371666524727153168"),
+    # Đã probe trực tiếp với sami_text_to_speech ngày 2026-08-10. Hai speaker
+    # Neural HoaiMy/NamMinh bị loại vì trả 40402004/TTSInvalidSpeaker.
     "🇻🇳 Nhỏ Ngọt Ngào":                  ("BV421_vivn_streaming",                 "7252594014782755330"),
+    "🇻🇳 Giọng Nữ Phổ Thông":             ("vi_female_huong",                      "7264854897953083905"),
+    "🇻🇳 Giọng Bé":                       ("BV074_streaming_dsp",                  "7550087831092251920"),
+    "🇻🇳 Cô Gái Hoạt Ngôn":               ("BV074_streaming",                      "7102355709945188865"),
+    "🇻🇳 Việt Méo":                       ("BV075_streaming_vibrato_dsp",          "7569450639810465040"),
+    "🇻🇳 Mai":                            ("BV562_streaming",                      "7483736254694035984"),
+    "🇻🇳 Ban Mai":                        ("multi_female_yangguangnv_uranus_bigtts","7637456432522218773"),
+    "🇻🇳 Nữ Review Phim":                 ("multi_female_richgirl_uranus_bigtts",  "7637460351541447956"),
+    "🇻🇳 Bản Tin 1":                      ("multi_female_quanweinv_uranus_bigtts", "7637458743197732117"),
+    "🇻🇳 Review Phim 4":                  ("multi_female_stokie_uranus_bigtts",    "7637456729696996628"),
+    "🇻🇳 Bản Tin Nữ":                     ("multi_female_sisi_uranus_bigtts",      "7637455857285860629"),
+    "🇻🇳 Review Phim 3":                  ("multi_female_daqi_uranus_bigtts",      "7637451983389019409"),
+    "🇻🇳 Review Phim 2":                  ("multi_female_xyf04auto_uranus_bigtts", "7637458743197732117"),
+    "🇻🇳 Sunny Idol":                     ("multi_female_kiwi_uranus_bigtts",      "7637457995882089749"),
+    "🇻🇳 Kenny Đại Đế":                   ("BV075_streaming_demon_dsp",            "7569442422665661712"),
     "🇻🇳 Robot VN":                       ("BV075_streaming_robot_dsp",            "7538698409633516816"),
+    "🇻🇳 Giọng Nam Trầm":                 ("multi_male_felipe_uranus_bigtts",      "7637456729696996628"),
+    "🇻🇳 Giọng Gái Mới Lớn":              ("multi_female_peiqi_uranus_bigtts",     "7637458789033151751"),
+    "🇻🇳 Nam Bản Tin":                    ("multi_female_xinwenjieshuo_uranus_bigtts","7637455039719640327"),
+    "🇻🇳 Nữ Thuyết Minh Ngọt Ngào":        ("multi_female_tianmeijieshuo_uranus_bigtts","7637460417295469832"),
+    "🇻🇳 Nam Tự Tin":                     ("BV075_streaming",                      "7102355803792740865"),
+    "🇻🇳 Alex Đại Đế":                    ("BV560_streaming",                      "7483736167565758992"),
     # ── English ─────────────────────────────────────────────────────────
     "🇺🇸 EN US Male":                     ("en_us_002",                            "7130515992936976897"),
     "🇺🇸 EN US Male 2":                   ("en_us_006",                            "7114563482518819329"),
@@ -88,7 +96,7 @@ CAPCUT_VOICES = {
 
 # Default voices for quick language selection
 CAPCUT_VOICE_DEFAULTS = {
-    "vi": "🇻🇳 Cô Gái Hoạt Ngôn (BV074)",
+    "vi": "🇻🇳 Cô Gái Hoạt Ngôn",
     "en": "🇺🇸 EN US Male",
 }
 
@@ -236,7 +244,7 @@ def poll_tts_task(task_id: str, token: str, timeout: float = 120.0):
 
 def tts_capcut(
     text: str,
-    voice_key: str = "🇻🇳 Cô Gái Hoạt Ngôn (BV074)",
+    voice_key: str = "🇻🇳 Cô Gái Hoạt Ngôn",
     rate: str = "1.0",
     out_path: Optional[str] = None,
     srt_out: Optional[str] = None,
@@ -260,15 +268,18 @@ def tts_capcut(
         print(f"[CapCut TTS] Not available: {_CC_IMPORT_ERR}")
         return None, None
 
-    voice_type, resource_id = CAPCUT_VOICES.get(voice_key, ("BV074_streaming", "7102355709945188865"))
-    voice_lang = (
-        "ko-KR" if "🇰🇷" in voice_key
-        else "vi-VN" if "🇻🇳" in voice_key
-        else "ja-JP" if "🇯🇵" in voice_key
-        else "en-US"
-    )
-
     try:
+        # Không âm thầm đổi một key cũ/không hợp lệ sang BV074. Việc đó che giấu
+        # cấu hình project lỗi và có thể làm đổi giọng giữa các cảnh.
+        if voice_key not in CAPCUT_VOICES:
+            raise ValueError(f"Giọng CapCut không được hỗ trợ: {voice_key!r}")
+        voice_type, resource_id = CAPCUT_VOICES[voice_key]
+        voice_lang = (
+            "ko-KR" if "🇰🇷" in voice_key
+            else "vi-VN" if "🇻🇳" in voice_key
+            else "ja-JP" if "🇯🇵" in voice_key
+            else "en-US"
+        )
         # _build_tts_request đã dùng _fresh_device() → deepcopy + randomize device IDs
         # KHÔNG mutate DEFAULT_DEVICE trực tiếp vì sẽ gây lỗi concurrent requests
 
