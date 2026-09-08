@@ -6,16 +6,17 @@
 
 - Pipeline video dài và Shorts: kịch bản → cảnh → voice → footage → phụ đề → MP4.
 - Gemini, Groq và OpenAI cho kịch bản, hình ảnh và thumbnail.
-- CapCut TTS, Edge TTS và Groq TTS.
-- Footage từ Pexels, Pixabay và Coverr.
+- CapCut TTS (20+ giọng Việt/Anh/Hàn), Edge TTS và Groq TTS.
+- Footage từ Pexels, Pixabay và Coverr; xen kẽ video + ảnh tự động.
 - Veo 3 Studio và Creative Studio cho video AI theo từng cảnh.
 - Đăng ngay hoặc đặt lịch lên Facebook Fanpage, YouTube Shorts và TikTok.
 - Lưu nhiều API key để tự động fallback khi hết quota.
+- Cache TTS theo hash (giọng + tốc độ + text) — chỉ re-generate khi thay đổi.
 
 ## Yêu cầu
 
 - Python 3.9 trở lên.
-- FFmpeg có hỗ trợ `libass` để burn phụ đề.
+- FFmpeg (standard build) — **dùng `brew install ffmpeg`, không dùng `ffmpeg-full`**.
 - Node.js chỉ cần khi sử dụng project độc lập `Auto-Create-Video/`.
 
 ## Cài đặt
@@ -26,28 +27,26 @@ cd ai-video-creator
 
 python3 -m venv venv
 source venv/bin/activate
-pip install streamlit requests cryptography edge-tts google-genai playwright
+pip install streamlit requests cryptography edge-tts google-genai playwright watchdog
 ```
 
-Trên macOS, cài FFmpeg bằng Homebrew:
+Cài FFmpeg trên macOS:
 
 ```bash
 brew install ffmpeg
 ```
 
-Nếu bản FFmpeg mặc định không có `libass`:
-
-```bash
-brew install ffmpeg-full
-```
+> ⚠️ **Không dùng `ffmpeg-full`** — bản này hay bị broken do dependency `libx265` không tương thích sau khi upgrade Homebrew. App tự động chọn bản hoạt động được.
 
 ## Chạy ứng dụng
 
 ```bash
-streamlit run tool.py
+python3 -m streamlit run tool.py
 ```
 
 Sau đó mở [http://localhost:8501](http://localhost:8501).
+
+> 💡 Cài `watchdog` để Streamlit tự reload khi sửa code: `pip install watchdog`
 
 Các tab chính:
 
@@ -102,7 +101,7 @@ Xem hướng dẫn chi tiết tại [`docs/social-publishing-setup.md`](docs/soc
 | `~/.avc_project.json` | Trạng thái pipeline video dài |
 | `~/.avc_project_shorts.json` | Trạng thái pipeline Shorts |
 | `~/.avc_creative_project.json` | Trạng thái Creative Studio |
-| `~/.avc_audio/` | Cache TTS |
+| `~/.avc_audio/` | Cache TTS (hash theo giọng + tốc độ + text) |
 | `~/.avc_social/social.db` | Metadata tài khoản, lịch đăng và audit; không chứa credential thật |
 | `~/Desktop/AI_Videos/` | Video xuất ra mặc định |
 
@@ -116,10 +115,10 @@ ai-video-creator/
 ├── social_publisher.py     # OAuth, database, worker và provider publishing
 ├── social_publisher_ui.py  # Giao diện kết nối và xuất bản
 ├── veo3_video.py           # Tích hợp Veo 3 API
-├── capcut_tts.py           # Adapter CapCut TTS
+├── capcut_tts.py           # Adapter CapCut TTS (20+ giọng, retry, cache)
 ├── vietnamese_tts.py       # Chuẩn hóa nội dung tiếng Việt cho TTS
 ├── video_config.py         # Kiểm tra cấu hình script import
-├── capcut-tts-api/         # Client CapCut TTS
+├── capcut-tts-api/         # Client CapCut TTS (submit/poll/download)
 ├── Auto-Create-Video/      # Pipeline TypeScript độc lập
 └── docs/                   # Spec và tài liệu thiết kế
 ```
@@ -147,11 +146,13 @@ npm run typecheck
 
 ## Xử lý lỗi thường gặp
 
-- **Không tìm thấy FFmpeg:** chạy `which ffmpeg`, sau đó cài lại bằng Homebrew.
-- **Phụ đề không xuất hiện:** dùng bản FFmpeg có `libass`.
+- **TTS cảnh 1 fail, cảnh còn lại có cache:** hash thay đổi do đổi giọng/tốc độ — bấm **Render lại**, cảnh có cache không bị tạo lại.
+- **FFmpeg không tìm thấy hoặc crash (libx265/libx264):** gỡ `ffmpeg-full` rồi cài lại `ffmpeg` standard: `brew uninstall ffmpeg-full && brew install ffmpeg`.
+- **Phụ đề không xuất hiện:** FFmpeg standard đã có `libass`; nếu vẫn lỗi chạy `ffmpeg -filters | grep ass`.
 - **API hết quota:** thêm key dự phòng trong Settings.
-- **Key không được nhận sau khi cập nhật:** khởi động lại tiến trình Streamlit.
+- **Key không được nhận sau khi cập nhật:** khởi động lại tiến trình Streamlit (`Ctrl+C` → `python3 -m streamlit run tool.py`).
 - **OAuth hết hạn:** vào Settings và kết nối lại tài khoản tương ứng.
+- **Streamlit không tự reload sau khi sửa code:** cài `pip install watchdog` để bật file watcher nhanh.
 
 ## Bảo mật
 

@@ -4,6 +4,7 @@ Chạy: streamlit run tool.py
 """
 import streamlit as st
 from vietnamese_tts import normalize_vietnamese_tts
+from korean_tts import normalize_korean_tts
 from video_config import normalize_import_video_config
 import asyncio, json, os, re, uuid, base64, subprocess, shutil, time, tempfile, random, math
 from typing import Optional
@@ -81,27 +82,39 @@ if _SOCIAL_PUBLISHING_OK:
 
 # Prefer ffmpeg-full (has libass/subtitles filter) over standard ffmpeg
 def _find_ffmpeg():
-    """Tìm ffmpeg hoạt động được — validate runtime, không chỉ kiểm tra file.
-    /opt/homebrew/bin/ffmpeg (standard) ưu tiên hơn ffmpeg-full vì ffmpeg-full
-    có thể bị broken do dependency libx265/libx264 không tương thích version."""
+    """Tìm ffmpeg hoạt động được — ưu tiên ffmpeg-full (có libass/ass filter) để burn sub.
+    Validate runtime thực sự chạy được trước khi dùng."""
     import os as _os, subprocess as _sp
     candidates = [
-        "/opt/homebrew/bin/ffmpeg",           # standard Homebrew — thường stable
-        "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg",  # ffmpeg-full — nhiều codec nhưng hay broken
+        "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg",  # ffmpeg-full — có libass để burn sub
+        "/opt/homebrew/Cellar/ffmpeg-full/9.0.1_1/bin/ffmpeg",  # fallback Cellar path
+        "/opt/homebrew/Cellar/ffmpeg-full/8.1.2/bin/ffmpeg",
+        "/opt/homebrew/bin/ffmpeg",           # standard Homebrew — không có libass
         "/usr/local/bin/ffmpeg",
         "/usr/bin/ffmpeg",
     ]
+    best = None  # ffmpeg chạy được nhưng không có libass
     for c in candidates:
         if not (_os.path.isfile(c) and _os.access(c, _os.X_OK)):
             continue
         # Validate thực sự chạy được (tránh broken shared library)
         try:
             r = _sp.run([c, "-version"], capture_output=True, timeout=5)
-            if r.returncode == 0:
-                return c
+            if r.returncode != 0:
+                continue
         except Exception:
             continue
-    return shutil.which("ffmpeg")
+        # Kiểm tra có subtitles/ass filter (cần libass)
+        try:
+            rf = _sp.run([c, "-filters"], capture_output=True, text=True, timeout=10)
+            if "subtitles" in rf.stdout or "ass" in rf.stdout:
+                return c  # Tìm được ffmpeg tốt nhất — có libass
+        except Exception:
+            pass
+        if best is None:
+            best = c  # Lưu ffmpeg chạy được nhưng không có libass
+    return best or shutil.which("ffmpeg")
+
 
 FFMPEG = _find_ffmpeg()
 
@@ -1135,7 +1148,9 @@ def tts(text, voice_cfg="en-US", srt_out=None, rate="1.0",
     """
     global _CAPCUT_FAIL_COUNT, _CAPCUT_SKIP
     if "🇻🇳" in voice_cfg or voice_cfg in ("vi-VN", "vi-female"):
-        text = normalize_vietnamese_tts(text)
+        text = normalize_vietnamese_tts(text, voice_key=voice_cfg)
+    if "🇰🇷" in voice_cfg or voice_cfg in ("ko-KR", "ko-female"):
+        text = normalize_korean_tts(text)
     # ── CapCut TTS (preferred, chunked để tránh bị cắt tiếng) ────────────────
     if _CAPCUT_OK and not _CAPCUT_SKIP and voice_cfg in _cc.CAPCUT_VOICES:
         CAPCUT_MAX_CHARS = 350
@@ -7073,7 +7088,10 @@ with tab_main:
                                 _aspect_r = proj.get("aspect", "9:16 (Shorts/TikTok)")
                                 _W_r, _H_r = (1080, 1920) if "9:16" in _aspect_r else (1920, 1080)
                                 _sub_style_r = proj.get("sub_style", "🟡 TikTok Yellow (Viral)")
-                                _show_sub_r = bool(_s.get("srtFile") and Path(_s["srtFile"]).exists())
+                                _sub_checkbox_r = st.session_state.get(f"{_proj_mode_slug_r}_show_subtitles", True)
+                                _srt_file_r_check = _s.get("srtFile", "")
+                                _srt_exists_r = bool(_srt_file_r_check and Path(_srt_file_r_check).exists())
+                                _show_sub_r = bool(_sub_checkbox_r and _srt_exists_r)
                                 _enable_trans_r = proj.get("enable_transition", False)
                                 _voice_r = proj.get("voice_cfg_key", "en-US")
                                 _rate_r = proj.get("tts_rate", "1.0")
@@ -7215,6 +7233,18 @@ with tab_main:
                                         _out_r = _s_dir_r / "scene.mp4"
                                         _srt_r = _s.get("srtFile")
                                         _has_srt_r = False
+
+                                        # Nếu srtFile chưa có nhưng checkbox bật → tự tạo SRT từ audio
+                                        if _sub_checkbox_r and HAS_SUB and _src_audio_r and not _srt_exists_r:
+                                            _auto_srt_r = _s_dir_r / "auto.srt"
+                                            try:
+                                                srt_from_audio(str(_src_audio_r), _s.get("text", ""), str(_auto_srt_r), tts_rate=_rate_r)
+                                                if _auto_srt_r.exists() and _auto_srt_r.stat().st_size > 10:
+                                                    _srt_r = str(_auto_srt_r)
+                                                    _show_sub_r = True
+                                            except Exception as _srt_gen_e:
+                                                st.warning(f"Không tạo được SRT: {_srt_gen_e}")
+
                                         if _show_sub_r and HAS_SUB and _srt_r and Path(_srt_r).exists():
                                             try:
                                                 _wl_r = srt_to_words(_srt_r)
