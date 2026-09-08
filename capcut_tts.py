@@ -31,6 +31,7 @@ if str(_CC_DIR) not in sys.path:
 
 _CC_AVAILABLE = False
 _CC_IMPORT_ERR = ""
+_LAST_ERROR = ""  # Lưu lỗi TTS cuối để tool.py hiển thị trong Streamlit UI
 
 try:
     from capcut_common_task_client import (
@@ -45,8 +46,13 @@ try:
         BASE,
     )
     _CC_AVAILABLE = True
-except ImportError as _e:
+except Exception as _e:
+    # Bắt rộng (không chỉ ImportError) vì Streamlit reload có thể
+    # gây RuntimeError / AttributeError khi module đang được reload.
+    import traceback as _import_tb
     _CC_IMPORT_ERR = str(_e)
+    print(f"[CapCut TTS] Import error ({type(_e).__name__}): {_e}")
+    _import_tb.print_exc()
 
 
 # ── Vietnamese, English & Korean voices from Voice.json (curated subset) ───────
@@ -312,7 +318,20 @@ def tts_capcut(
         return str(out_path), srt_content
 
     except Exception as e:
-        print(f"[CapCut TTS] Error: {e}")
+        import traceback as _tb
+        global _LAST_ERROR
+        # Re-raise Streamlit internal exceptions (StopException, RerunException)
+        # so Streamlit's flow control is not broken by our broad except clause.
+        _type_name = type(e).__name__
+        if _type_name in ("StopException", "RerunException", "StopIteration"):
+            raise
+        # Also re-raise if it comes from streamlit module
+        _mod = getattr(type(e), "__module__", "") or ""
+        if "streamlit" in _mod.lower():
+            raise
+        _LAST_ERROR = f"{_type_name}: {e}"
+        print(f"[CapCut TTS] Error ({_type_name}): {e}")
+        _tb.print_exc()
         return None, None
 
 

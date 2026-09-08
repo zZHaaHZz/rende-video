@@ -24,16 +24,18 @@ except Exception as _social_import_error:
     print(f"[social] Module not loaded: {_social_import_error}")
 
 # ── CapCut TTS ────────────────────────────────────────────────────────────────
+# KHÔNG reload capcut_tts thủ công — Streamlit có file watcher riêng.
+# importlib.reload() gây dirty sys.modules state và làm _CC_AVAILABLE=False trong Streamlit.
 try:
-    import sys as _sys
-    if "capcut_tts" in _sys.modules:
-        import importlib as _importlib
-        _importlib.reload(_sys.modules["capcut_tts"])
     import capcut_tts as _cc
     _CAPCUT_OK = _cc.is_available()
+    if not _CAPCUT_OK:
+        print(f"[tool] CapCut TTS loaded nhưng not available: {_cc._CC_IMPORT_ERR}")
 except Exception as _cce:
+    import traceback as _cce_tb
     _CAPCUT_OK = False
-    print(f"[tool] CapCut TTS not loaded: {_cce}")
+    print(f"[tool] CapCut TTS not loaded ({type(_cce).__name__}): {_cce}")
+    _cce_tb.print_exc()
 
 # ── Veo3 Video Generation ─────────────────────────────────────────────────────
 try:
@@ -78,11 +80,31 @@ if _SOCIAL_PUBLISHING_OK:
         print(f"[social] Runtime not started: {_social_runtime_error}")
 
 # Prefer ffmpeg-full (has libass/subtitles filter) over standard ffmpeg
-FFMPEG = (
-    shutil.which("/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg")
-    or shutil.which("ffmpeg")
-    or shutil.which("/opt/homebrew/bin/ffmpeg")
-)
+def _find_ffmpeg():
+    """Tìm ffmpeg hoạt động được — validate runtime, không chỉ kiểm tra file.
+    /opt/homebrew/bin/ffmpeg (standard) ưu tiên hơn ffmpeg-full vì ffmpeg-full
+    có thể bị broken do dependency libx265/libx264 không tương thích version."""
+    import os as _os, subprocess as _sp
+    candidates = [
+        "/opt/homebrew/bin/ffmpeg",           # standard Homebrew — thường stable
+        "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg",  # ffmpeg-full — nhiều codec nhưng hay broken
+        "/usr/local/bin/ffmpeg",
+        "/usr/bin/ffmpeg",
+    ]
+    for c in candidates:
+        if not (_os.path.isfile(c) and _os.access(c, _os.X_OK)):
+            continue
+        # Validate thực sự chạy được (tránh broken shared library)
+        try:
+            r = _sp.run([c, "-version"], capture_output=True, timeout=5)
+            if r.returncode == 0:
+                return c
+        except Exception:
+            continue
+    return shutil.which("ffmpeg")
+
+FFMPEG = _find_ffmpeg()
+
 TMP = Path(tempfile.gettempdir()) / "avc"
 TMP.mkdir(exist_ok=True)
 AUDIO_DIR = Path.home() / ".avc_audio"  # Permanent audio cache
@@ -1140,8 +1162,25 @@ def tts(text, voice_cfg="en-US", srt_out=None, rate="1.0",
                 ffmpeg_bin=FFMPEG or "ffmpeg",
             )
             if not audio:
+                # Retry 1 lần sau 5s — tránh lỗi transient network/rate-limit
+                print(f"[TTS] CapCut chunk {ci+1} lần 1 fail → cooldown 5s rồi retry...")
+                import time as _t2
+                _t2.sleep(5)
+                chunk_audio2 = AUDIO_DIR / f"{uuid.uuid4().hex}_c{ci}_r.mp3"
+                audio, _ = _cc.tts_capcut(
+                    chunk_text,
+                    voice_key=voice_cfg,
+                    rate=rate,
+                    out_path=chunk_audio2,
+                    srt_out=str(chunk_srt) if chunk_srt else None,
+                    ffmpeg_bin=FFMPEG or "ffmpeg",
+                )
+                if audio:
+                    chunk_audio = chunk_audio2
+                    print(f"[TTS] CapCut chunk {ci+1} retry thành công ✅")
+            if not audio:
                 _next_action = "fallback" if allow_edge_fallback else "giữ nguyên giọng, không fallback"
-                print(f"[TTS] CapCut chunk {ci+1}/{len(chunks)} failed → {_next_action}")
+                print(f"[TTS] CapCut chunk {ci+1}/{len(chunks)} failed sau retry → {_next_action}")
                 chunk_failed = True
                 break
 
@@ -2813,7 +2852,7 @@ with tab_settings:
             "api": "Veo API — tự động hoàn toàn, CÓ dùng API credit",
             "google_flow": "Google Flow (UseAPI) — tạo video tự động qua UseAPI.net",
         }[value],
-        index=["stock", "gemini_web", "api", "google_flow"].index(cfg.get("veo3_provider", "stock")),
+        index=["stock", "gemini_web", "api", "google_flow"].index(cfg.get("veo3_provider", "stock") if cfg.get("veo3_provider", "stock") in ["stock", "gemini_web", "api", "google_flow"] else "stock"),
         horizontal=True,
         key="veo3_provider_radio",
     )
@@ -5205,10 +5244,13 @@ with tab_main:
                                     log(f"     → Nguyên nhân có thể: rate limit CapCut, asyncio conflict, hoặc mất mạng")
                                     log(f"     → Chạy Render lại: cảnh đã thành công dùng cache, chỉ cảnh lỗi được tạo lại")
                             else:
+                                _real_err = getattr(_cc, "_LAST_ERROR", "") if _CAPCUT_OK else ""
                                 log(
                                     f"  ❌ CẢNH {i+1}: giọng '{voice_cfg_key}' không tạo được. "
                                     "Không đổi sang Hoài My vì tùy chọn giọng dự phòng đang tắt."
                                 )
+                                if _real_err:
+                                    log(f"     🔍 Lỗi thực sự: {_real_err}")
                                 log("     → Chờ một lúc rồi Render lại; các cảnh đã thành công vẫn dùng cache.")
                         # ── Update audio duration + path + srtFile cho scene ──
                         estimated_dur = max(3.0, len(s["text"].split()) / 3.5)
