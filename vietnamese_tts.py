@@ -134,9 +134,9 @@ _PHONETIC_TERMS = (
     (re.compile(r"\bBTC\b"),            "Bitcoin"),
     (re.compile(r"\bETH\b"),            "Ethereum"),
     # Số kèm K/M/B → expand trước vì donglao-g2p không hiểu unit này
-    (re.compile(r"(\d+)\s*K\b"),        lambda m: f"{m.group(1)} nghìn"),
-    (re.compile(r"(\d+)\s*M\b"),        lambda m: f"{m.group(1)} triệu"),
-    (re.compile(r"(\d+)\s*B\b"),        lambda m: f"{m.group(1)} tỷ"),
+    (re.compile(r"(\d+)\s*K\b", re.IGNORECASE), lambda m: f"{m.group(1)} nghìn"),
+    (re.compile(r"(\d+)\s*M\b", re.IGNORECASE), lambda m: f"{m.group(1)} triệu"),
+    (re.compile(r"(\d+)\s*B\b", re.IGNORECASE), lambda m: f"{m.group(1)} tỷ"),
 )
 
 

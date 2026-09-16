@@ -38,6 +38,16 @@ except Exception as _cce:
     print(f"[tool] CapCut TTS not loaded ({type(_cce).__name__}): {_cce}")
     _cce_tb.print_exc()
 
+# ── ZeroTTS (local offline, opset-17 ONNX, Python ≥3.11) ────────────────────
+try:
+    import zerotts_adapter as _zt
+    _ZEROTTS_OK = _zt.is_available()
+    if not _ZEROTTS_OK:
+        print(f"[tool] ZeroTTS loaded nhưng not available: {_zt._ZEROTTS_IMPORT_ERR}")
+except Exception as _zte:
+    _ZEROTTS_OK = False
+    print(f"[tool] ZeroTTS not loaded: {_zte}")
+
 # ── Veo3 Video Generation ─────────────────────────────────────────────────────
 try:
     import veo3_video as _veo3
@@ -664,20 +674,29 @@ def generate_thumbnail(script: dict, gemini_key: Optional[str], W: int, H: int,
         print(f"[Thumbnail/Gemini] {msg}")
         return None, msg
 
-def generate_scene_image_ai(keyword: str, gemini_key: str, W: int, H: int, save_path: Path):
+def generate_scene_image_ai(keyword: str, gemini_key: str, W: int, H: int, save_path: Path,
+                            image_prompt: str = ""):
     """
-    Sinh ảnh AI tĩnh (cho 1 cảnh) bằng Gemini Imagen 3 dựa trên từ khóa.
+    Sinh ảnh AI tĩnh (cho 1 cảnh) bằng Gemini Imagen 3.
+    Ưu tiên image_prompt từ JSON/UI nếu có, fallback về keyword.
     Tạo ra ảnh chất lượng cao, cinematic để kết hợp với Ken Burns effect.
     """
     if not gemini_key:
         return None, "Không có Gemini API Key"
     
     ar = "16:9" if W > H else "9:16"
-    prompt = (
-        f"A cinematic, hyper-realistic photo of {keyword}. "
-        "Dramatic lighting, visually stunning, high emotional impact. "
-        "NO text, no borders, no logos, photorealistic."
-    )
+    if image_prompt and len(image_prompt.strip()) > 10:
+        # Dùng imagePrompt từ JSON/UI trực tiếp — thêm hậu tố chất lượng
+        prompt = (
+            image_prompt.strip().rstrip(".") +
+            ". NO text, no borders, no logos, photorealistic, cinematic."
+        )
+    else:
+        prompt = (
+            f"A cinematic, hyper-realistic photo of {keyword}. "
+            "Dramatic lighting, visually stunning, high emotional impact. "
+            "NO text, no borders, no logos, photorealistic."
+        )
     
     try:
         import base64 as _b64
@@ -708,11 +727,20 @@ EDGE_VOICES = {
     "vi-female": "vi-VN-HoaiMyNeural",
     "ko-KR": "ko-KR-InJoonNeural",   # Male KO
     "ko-female": "ko-KR-SunHiNeural",# Female KO
+    # ── Tiếng Việt (tên đẹp) ────────────────────────────────
+    "🆻🇳 NamMinh (Nam — Long-form)": "vi-VN-NamMinhNeural",   # Trầm, tâm sự, speed +0~5%
+    "🆻🇳 NamMinh (Nam — Shorts x1.4)": "vi-VN-NamMinhNeural",  # Sắc bén, dồn dập, speed +40%
+    "🆻🇳 HoaiMy (Nữ)": "vi-VN-HoaiMyNeural",
+    # ── Tiếng Hàn ──────────────────────────────────────────
     "🇰🇷 Hyunsu Đa Ngôn Ngữ (Nam)": "ko-KR-HyunsuMultilingualNeural",
     "🇰🇷 InJoon (Nam)": "ko-KR-InJoonNeural",
     "🇰🇷 SunHi (Nữ)": "ko-KR-SunHiNeural",
-    "ja-JP": "ja-JP-KeitaNeural",      # Male JA
-    "ja-female": "ja-JP-NanamiNeural", # Female JA
+    # ── Tiếng Anh ──────────────────────────────────────────
+    "🇺🇸 Guy (Nam)": "en-US-GuyNeural",
+    "🇺🇸 Jenny (Nữ)": "en-US-JennyNeural",
+    # ── Tiếng Nhật ──────────────────────────────────────────
+    "ja-JP": "ja-JP-KeitaNeural",
+    "ja-female": "ja-JP-NanamiNeural",
 }
 
 KOREAN_EDGE_VOICES = [
@@ -768,39 +796,66 @@ def tts_edge_with_timing(text, voice_key="en-US", audio_out=None, srt_out=None, 
                 words = _exe.submit(_run_in_thread).result(timeout=60)
 
             if Path(audio_out).exists() and Path(audio_out).stat().st_size > 1000:
-                if not words:
-                    dur = 5.0
-                    try:
-                        probe = subprocess.run(
-                            [FFMPEG, "-i", str(audio_out), "-f", "null", "-"],
-                            capture_output=True, text=True
-                        )
-                        for line in probe.stderr.split("\n"):
-                            if "Duration:" in line:
-                                ts = line.split("Duration:")[1].split(",")[0].strip()
-                                h, m, s = ts.split(":")
-                                dur = int(h)*3600 + int(m)*60 + float(s)
-                                print(f"[TTS] Detected audio duration: {dur:.2f}s")
-                                break
-                    except Exception as pe:
-                        print(f"[TTS] Duration probe failed: {pe}")
+                # ── Probe actual audio duration ──────────────────────────────────
+                _audio_dur = 5.0
+                try:
+                    _probe_dur = subprocess.run(
+                        [FFMPEG, "-i", str(audio_out), "-f", "null", "-"],
+                        capture_output=True, text=True
+                    )
+                    for _line in _probe_dur.stderr.split("\n"):
+                        if "Duration:" in _line:
+                            _ts = _line.split("Duration:")[1].split(",")[0].strip()
+                            _hh, _mm, _ss = _ts.split(":")
+                            _audio_dur = int(_hh)*3600 + int(_mm)*60 + float(_ss)
+                            print(f"[TTS] Detected audio duration: {_audio_dur:.2f}s")
+                            break
+                except Exception as _pe:
+                    print(f"[TTS] Duration probe failed: {_pe}")
 
-                    text_words = text.split()
-                    if text_words and dur > 0:
-                        # CJK weight: Hangul/CJK ký tự nặng hơn ASCII khi tính timing
-                        def _cjk_w(ch):
-                            cp = ord(ch)
-                            if (0xAC00 <= cp <= 0xD7A3 or 0x1100 <= cp <= 0x11FF
-                                    or 0x4E00 <= cp <= 0x9FFF or 0x3040 <= cp <= 0x30FF):
-                                return 1.8
-                            return 1.0
-                        char_lens = [max(1.0, sum(_cjk_w(c) for c in w)) for w in text_words]
-                        total_chars = sum(char_lens)
-                        t = 0.0
-                        for w, cl in zip(text_words, char_lens):
-                            word_dur = dur * cl / total_chars
-                            words.append({"word": w, "start": t, "end": t + word_dur})
-                            t += word_dur
+                def _cjk_w(ch):
+                    cp = ord(ch)
+                    if (0xAC00 <= cp <= 0xD7A3 or 0x1100 <= cp <= 0x11FF
+                            or 0x4E00 <= cp <= 0x9FFF or 0x3040 <= cp <= 0x30FF):
+                        return 1.8
+                    return 1.0
+
+                text_words = text.split()
+                if not words:
+                    # No word boundaries at all → proportional fallback
+                    if text_words and _audio_dur > 0:
+                        _char_lens = [max(1.0, sum(_cjk_w(c) for c in w)) for w in text_words]
+                        _total_chars = sum(_char_lens)
+                        _t = 0.0
+                        for _w, _cl in zip(text_words, _char_lens):
+                            _wd = _audio_dur * _cl / _total_chars
+                            words.append({"word": _w, "start": _t, "end": _t + _wd})
+                            _t += _wd
+                else:
+                    # ── CRITICAL FIX: Edge TTS Korean often skips the last 1-3 words
+                    # in WordBoundary events. Compare covered text vs full text and
+                    # fill in any missing tail words with proportional timing. ────────
+                    _covered = " ".join(w["word"] for w in words)
+                    _full    = " ".join(text_words)
+                    # Find the last word index covered by boundaries
+                    _covered_words_set = [w["word"].lower().strip('?!.,;:') for w in words]
+                    _text_words_clean  = [w.lower().strip('?!.,;:') for w in text_words]
+                    # Count how many text_words are NOT yet in words list (tail mismatch)
+                    # Simple approach: if words count < text_words count, fill the gap
+                    _n_boundary = len(words)
+                    _n_text     = len(text_words)
+                    if _n_boundary < _n_text:
+                        _last_end = words[-1]["end"] if words else 0.0
+                        _remaining_dur = max(0.05, _audio_dur - _last_end)
+                        _missing_words = text_words[_n_boundary:]
+                        _ml = [max(1.0, sum(_cjk_w(c) for c in w)) for w in _missing_words]
+                        _mt = sum(_ml) or 1.0
+                        _t = _last_end
+                        for _mw, _mc in zip(_missing_words, _ml):
+                            _md = _remaining_dur * _mc / _mt
+                            words.append({"word": _mw, "start": _t, "end": _t + _md})
+                            _t += _md
+                        print(f"[TTS] Filled {len(_missing_words)} missing tail word(s) for Korean: {_missing_words}")
 
                 _is_cjk = any(
                     0xAC00 <= ord(c) <= 0xD7A3 or 0x4E00 <= ord(c) <= 0x9FFF or 0x3040 <= ord(c) <= 0x30FF
@@ -835,7 +890,7 @@ def make_srt(words, group=4):
     chunks, cur_chunk = [], []
     for w in words:
         cur_chunk.append(w)
-        # Nếu đạt đến giới hạn group và đây là điểm ngầt tự nhiên — cắt
+        # Nếu đạt đến giới hạn group và đây là điểm ngắt tự nhiên — cắt
         if len(cur_chunk) >= group and _has_punct(w):
             chunks.append(cur_chunk)
             cur_chunk = []
@@ -843,6 +898,8 @@ def make_srt(words, group=4):
         elif len(cur_chunk) >= group * 2:
             chunks.append(cur_chunk)
             cur_chunk = []
+    # CRITICAL FIX: luôn flush cur_chunk còn lại (ngay cả khi không có dấu câu)
+    # Đây là lý do text tiếng Hàn bị mất cuối câu — cur_chunk không bao giờ được append.
     if cur_chunk:
         chunks.append(cur_chunk)
 
@@ -884,15 +941,29 @@ def srt_to_words(srt_path):
 
 # ── Subtitle style presets ────────────────────────────────────────────────
 SUB_STYLES = {
+    # ── KIỂU VIRAL CỔ ĐIỂN (Outline only — không nền) ──────────────────────
     # back = &H00000000 → fully transparent (no box background)
     # BorderStyle=1 in header → outline-only (no opaque box)
-    "🟡 TikTok Yellow (Viral)":   {"highlight": "&H0000FFFF", "base": "&H00FFFFFF", "outline": "&H00000000", "back": "&H00000000", "bold": -1, "shadow": 2},
-    "🔥 Fire Orange":              {"highlight": "&H000055FF", "base": "&H00FFFFFF", "outline": "&H00000000", "back": "&H00000000", "bold": -1, "shadow": 2},
-    "💚 Neon Green":               {"highlight": "&H0000FF66", "base": "&H00FFFFFF", "outline": "&H00000000", "back": "&H00000000", "bold": -1, "shadow": 2},
-    "💙 Electric Blue":            {"highlight": "&H00FF8800", "base": "&H00FFFFFF", "outline": "&H00000000", "back": "&H00000000", "bold": -1, "shadow": 2},
-    "🩷 Hot Pink":                 {"highlight": "&H006633FF", "base": "&H00FFFFFF", "outline": "&H00000000", "back": "&H00000000", "bold": -1, "shadow": 2},
-    "⚪ Classic White (Không màu)": {"highlight": "&H00FFFFFF", "base": "&H00FFFFFF", "outline": "&H00000000", "back": "&H00000000", "bold": -1, "shadow": 1},
+    "🟡 TikTok Yellow (Viral)":   {"highlight": "&H0000FFFF", "base": "&H00FFFFFF", "outline": "&H00000000", "back": "&H00000000", "bold": -1, "shadow": 2, "border_style": 1, "outline_w": 2, "spacing": 0},
+    "🔥 Fire Orange":              {"highlight": "&H000055FF", "base": "&H00FFFFFF", "outline": "&H00000000", "back": "&H00000000", "bold": -1, "shadow": 2, "border_style": 1, "outline_w": 2, "spacing": 0},
+    "💚 Neon Green":               {"highlight": "&H0000FF66", "base": "&H00FFFFFF", "outline": "&H00000000", "back": "&H00000000", "bold": -1, "shadow": 2, "border_style": 1, "outline_w": 2, "spacing": 0},
+    "💙 Electric Blue":            {"highlight": "&H00FF8800", "base": "&H00FFFFFF", "outline": "&H00000000", "back": "&H00000000", "bold": -1, "shadow": 2, "border_style": 1, "outline_w": 2, "spacing": 0},
+    "🩷 Hot Pink":                 {"highlight": "&H006633FF", "base": "&H00FFFFFF", "outline": "&H00000000", "back": "&H00000000", "bold": -1, "shadow": 2, "border_style": 1, "outline_w": 2, "spacing": 0},
+    "⚪ Classic White (Không màu)": {"highlight": "&H00FFFFFF", "base": "&H00FFFFFF", "outline": "&H00000000", "back": "&H00000000", "bold": -1, "shadow": 1, "border_style": 1, "outline_w": 2, "spacing": 0},
+
+    # ── STYLE MỚI — VIRAL 2025 ───────────────────────────────────────────────
+
+    # MrBeast style: viền đen cực dày + shadow 3D nặng — nhìn nổi bật trên mọi nền
+    "🎬 MrBeast 3D":              {"highlight": "&H0000FFFF", "base": "&H00FFFFFF", "outline": "&H00000000", "back": "&H00000000", "bold": -1, "shadow": 4, "border_style": 1, "outline_w": 5, "spacing": 1},
+
+    # Reels Box: nền hộp đen mờ phía sau — kiểu Instagram Reels / TikTok Hàn Quốc
+    # BorderStyle=3 → opaque box; BackColour alpha 60 = mờ ~60%
+    "📦 Reels Box (Nền đen mờ)":  {"highlight": "&H0000FFFF", "base": "&H00FFFFFF", "outline": "&H00000000", "back": "&HA0000000", "bold": -1, "shadow": 0, "border_style": 3, "outline_w": 0, "spacing": 2},
+
+    # Korean Drama: nền đen đặc + từ highlight đỏ đậm — kiểu drama Hàn phụ đề
+    "🎭 Korean Drama":             {"highlight": "&H000000FF", "base": "&H00FFFFFF", "outline": "&H00000000", "back": "&HC0000000", "bold": -1, "shadow": 0, "border_style": 3, "outline_w": 0, "spacing": 1},
 }
+
 
 def make_ass(words, W=1920, H=1080, window=4, offset_s=0.0, style_name="🟡 TikTok Yellow (Viral)"):
     """ASS karaoke subtitle — hiển thị 4 từ/lần, highlight TỪNG TỪ khi đang nói.
@@ -921,6 +992,9 @@ def make_ass(words, W=1920, H=1080, window=4, offset_s=0.0, style_name="🟡 Tik
     back_color      = st_cfg["back"]
     bold            = st_cfg["bold"]
     shadow          = st_cfg["shadow"]
+    border_style    = st_cfg.get("border_style", 1)   # 1=outline, 3=opaque box
+    outline_w       = st_cfg.get("outline_w", 2)       # độ dày viền (px)
+    spacing         = st_cfg.get("spacing", 0)          # khoảng cách giữa các chữ
 
     # ── BƯỚC 1: Tách từng phrase SRT thành danh sách từ đơn lẻ với timestamp ──
     flat_words = []  # list of {"word": str, "start": float, "end": float}
@@ -953,12 +1027,11 @@ def make_ass(words, W=1920, H=1080, window=4, offset_s=0.0, style_name="🟡 Tik
         "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
         "Alignment, MarginL, MarginR, MarginV, Encoding\n"
         f"Style: Default,{font_name},{fs},{base_color},&H000000FF,{outline_color},{back_color},"
-        # BorderStyle=1 → outline-only (KHÔNG có hộp nền đen)
-        # BorderStyle=3 → opaque box (nền đen — đã bỏ)
-        f"{bold},0,0,0,100,100,0,0,1,2,{shadow},2,30,30,{margv},1\n\n"
+        f"{bold},0,0,0,100,100,{spacing},0,{border_style},{outline_w},{shadow},2,30,30,{margv},1\n\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
+
 
     def _t(s):
         s = max(0.0, s + offset_s)
@@ -1151,6 +1224,126 @@ def tts(text, voice_cfg="en-US", srt_out=None, rate="1.0",
         text = normalize_vietnamese_tts(text, voice_key=voice_cfg)
     if "🇰🇷" in voice_cfg or voice_cfg in ("ko-KR", "ko-female"):
         text = normalize_korean_tts(text)
+
+    # ── ZeroTTS (local offline — ưu tiên khi voice là ZeroTTS key) ───────────
+    if _ZEROTTS_OK and voice_cfg in _zt.ZEROTTS_VOICES:
+        _zt_audio_raw = AUDIO_DIR / f"{uuid.uuid4().hex}_zt_raw.mp3"
+        result = _zt.tts_zerotts(
+            text,
+            voice=voice_cfg,
+            out_path=str(_zt_audio_raw),
+            ffmpeg_bin=FFMPEG or "ffmpeg",
+        )
+        if result and Path(result).exists():
+            # ── Tạo SRT từ audio 1x TRƯỚC khi atempo ─────────────────────────
+            # Phân tích silence trên 1x audio → timing chính xác hơn
+            # Scale timestamps × (1/rate) cho audio đã speed-up
+            if srt_out:
+                try:
+                    _ffmpeg_bin = FFMPEG or "ffmpeg"
+
+                    # 1. Probe duration 1x
+                    _zt_dur1x = 0.0
+                    _zt_pb = subprocess.run(
+                        [_ffmpeg_bin, "-i", str(result), "-f", "null", "-"],
+                        capture_output=True, text=True
+                    )
+                    for _ln in _zt_pb.stderr.split("\n"):
+                        if "Duration:" in _ln:
+                            _ts = _ln.split("Duration:")[1].split(",")[0].strip()
+                            _h, _m, _s = _ts.split(":")
+                            _zt_dur1x = int(_h)*3600 + int(_m)*60 + float(_s)
+                            break
+
+                    # 2. Detect silence via event-based parsing
+                    _zt_sil = subprocess.run(
+                        [_ffmpeg_bin, "-i", str(result),
+                         "-af", "silencedetect=noise=-35dB:d=0.08",
+                         "-f", "null", "-"],
+                        capture_output=True, text=True
+                    )
+                    _sil_starts_raw, _sil_ends_raw = [], []
+                    for _ln in _zt_sil.stderr.split("\n"):
+                        if "silence_start:" in _ln:
+                            try: _sil_starts_raw.append(float(_ln.split("silence_start:")[1].strip()))
+                            except: pass
+                        elif "silence_end:" in _ln:
+                            try: _sil_ends_raw.append(float(_ln.split("silence_end:")[1].split("|")[0].strip()))
+                            except: pass
+
+                    # 3. Find speech_start and speech_end on 1x audio
+                    # speech_start = end of leading silence (first sil_end if before first sil_start)
+                    # speech_end   = start of trailing silence (last sil_start after last sil_end)
+                    _zt_speech_start_1x = 0.0
+                    _zt_speech_end_1x   = _zt_dur1x
+
+                    if _sil_ends_raw and (not _sil_starts_raw or _sil_ends_raw[0] < _sil_starts_raw[0]):
+                        _zt_speech_start_1x = _sil_ends_raw[0]
+                    if _sil_starts_raw and (not _sil_ends_raw or _sil_starts_raw[-1] > (_sil_ends_raw[-1] if _sil_ends_raw else 0)):
+                        _zt_speech_end_1x = _sil_starts_raw[-1]
+
+                    _zt_speech_dur_1x = max(0.1, _zt_speech_end_1x - _zt_speech_start_1x)
+                    print(f"[ZeroTTS] 1x speech: {_zt_speech_start_1x:.2f}s → {_zt_speech_end_1x:.2f}s (dur={_zt_speech_dur_1x:.2f}s)")
+
+                    # 4. Build word entries at 1x speed (uniform in speech range)
+                    _zt_toks = text.split()
+                    _zt_tok_dur = _zt_speech_dur_1x / max(len(_zt_toks), 1)
+                    _zt_words_1x = []
+                    for _i, _w in enumerate(_zt_toks):
+                        _ws = _zt_speech_start_1x + _i * _zt_tok_dur
+                        _zt_words_1x.append({"word": _w, "start": _ws, "end": _ws + _zt_tok_dur})
+
+                    # 5. Scale timestamps × (1/rate) → timing trên audio đã speed-up
+                    try: _zt_rate_f = float(rate) if rate else 1.0
+                    except: _zt_rate_f = 1.0
+                    _zt_scale = 1.0 / _zt_rate_f if _zt_rate_f > 0 else 1.0
+                    _zt_words_fast = [
+                        {"word": w["word"], "start": w["start"]*_zt_scale, "end": w["end"]*_zt_scale}
+                        for w in _zt_words_1x
+                    ]
+
+                    # 6. Write SRT
+                    _zt_srt = make_srt(_zt_words_fast, group=4)
+                    if _zt_srt:
+                        Path(srt_out).write_text(_zt_srt, encoding="utf-8")
+                        print(f"[ZeroTTS] SRT: {len(_zt_toks)} từ | speech {_zt_speech_start_1x:.2f}→{_zt_speech_end_1x:.2f}s (1x) | scale={_zt_scale:.3f}")
+                except Exception as _zt_srt_err:
+                    print(f"[ZeroTTS] SRT gen failed: {_zt_srt_err}")
+
+
+            # ZeroTTS không hỗ trợ speed nội tại — áp dụng FFmpeg atempo để điều chỉnh tốc độ
+            try:
+                _zt_rate = float(rate) if rate else 1.0
+            except (TypeError, ValueError):
+                _zt_rate = 1.0
+            if abs(_zt_rate - 1.0) < 0.05:  # không cần xử lý nếu xấp xỉ 1.0x
+                return result
+            # atempo chỉ hoạt động trong [0.5, 2.0]; chain filters nếu cần
+            _zt_audio_fast = AUDIO_DIR / f"{uuid.uuid4().hex}_zt_speed.mp3"
+            try:
+                if 0.5 <= _zt_rate <= 2.0:
+                    _atempo_chain = f"atempo={_zt_rate:.3f}"
+                elif _zt_rate > 2.0:
+                    _atempo_chain = f"atempo=2.0,atempo={_zt_rate/2.0:.3f}"
+                else:  # < 0.5
+                    _atempo_chain = f"atempo=0.5,atempo={_zt_rate/0.5:.3f}"
+                _sp_ret = subprocess.run(
+                    [FFMPEG or "ffmpeg", "-i", str(result),
+                     "-af", _atempo_chain,
+                     "-codec:a", "libmp3lame", "-q:a", "2",
+                     "-y", str(_zt_audio_fast)],
+                    capture_output=True, timeout=60
+                )
+                if _sp_ret.returncode == 0 and _zt_audio_fast.exists() and _zt_audio_fast.stat().st_size > 1000:
+                    Path(result).unlink(missing_ok=True)
+                    print(f"[ZeroTTS] atempo {_zt_rate}x applied ✅")
+                    return str(_zt_audio_fast)
+            except Exception as _zt_spd_err:
+                print(f"[ZeroTTS] atempo speed adjust failed: {_zt_spd_err} — dùng audio gốc")
+            return result
+        print("[TTS] ZeroTTS failed → fallback Edge TTS")
+
+
     # ── CapCut TTS (preferred, chunked để tránh bị cắt tiếng) ────────────────
     if _CAPCUT_OK and not _CAPCUT_SKIP and voice_cfg in _cc.CAPCUT_VOICES:
         CAPCUT_MAX_CHARS = 350
@@ -1273,7 +1466,7 @@ def tts(text, voice_cfg="en-US", srt_out=None, rate="1.0",
         edge_key = "en-US"
 
     audio_path = AUDIO_DIR / f"{uuid.uuid4().hex}.mp3"
-    audio, srt = tts_edge_with_timing(text, edge_key, audio_path, srt_out)
+    audio, srt = tts_edge_with_timing(text, edge_key, audio_path, srt_out, rate=rate)
     if audio: return audio
 
 
@@ -2629,16 +2822,16 @@ def make_image_effect_filter(W, H, dur, effect=None, cinematic=True):
     if effect == "zoom_in":
         # Zoom in từ 1.0 → 1.2, anchor giữa
         zp = (
-            f"zoompan=z='min(1+0.007*(on/{d_frames}),1.2)'"
+            f"zoompan=z='1+0.2*(on/{d_frames})'"
             f":x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
-            f":d={d_frames}:s={W}x{H}"
+            f":d={d_frames}:fps=30:s={W*2}x{H*2}"
         )
     elif effect == "zoom_out":
         # Zoom out từ 1.2 → 1.0, anchor giữa
         zp = (
-            f"zoompan=z='max(1.2-0.007*(on/{d_frames}),1.0)'"
+            f"zoompan=z='1.2-0.2*(on/{d_frames})'"
             f":x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
-            f":d={d_frames}:s={W}x{H}"
+            f":d={d_frames}:fps=30:s={W*2}x{H*2}"
         )
     elif effect == "pan_right":
         # Pan từ trái → phải với zoom nhẹ
@@ -2646,7 +2839,7 @@ def make_image_effect_filter(W, H, dur, effect=None, cinematic=True):
             f"zoompan=z='1.1'"
             f":x='(iw-iw/zoom)*(on/{d_frames})'"
             f":y='ih/2-(ih/zoom/2)'"
-            f":d={d_frames}:s={W}x{H}"
+            f":d={d_frames}:fps=30:s={W*2}x{H*2}"
         )
     elif effect == "pan_left":
         # Pan từ phải → trái với zoom nhẹ
@@ -2654,7 +2847,7 @@ def make_image_effect_filter(W, H, dur, effect=None, cinematic=True):
             f"zoompan=z='1.1'"
             f":x='(iw-iw/zoom)*(1-on/{d_frames})'"
             f":y='ih/2-(ih/zoom/2)'"
-            f":d={d_frames}:s={W}x{H}"
+            f":d={d_frames}:fps=30:s={W*2}x{H*2}"
         )
     elif effect == "pan_up":
         # Pan từ dưới → trên với zoom nhẹ
@@ -2662,7 +2855,7 @@ def make_image_effect_filter(W, H, dur, effect=None, cinematic=True):
             f"zoompan=z='1.1'"
             f":x='iw/2-(iw/zoom/2)'"
             f":y='(ih-ih/zoom)*(1-on/{d_frames})'"
-            f":d={d_frames}:s={W}x{H}"
+            f":d={d_frames}:fps=30:s={W*2}x{H*2}"
         )
     else:  # pan_down
         # Pan từ trên → xuống với zoom nhẹ
@@ -2670,10 +2863,11 @@ def make_image_effect_filter(W, H, dur, effect=None, cinematic=True):
             f"zoompan=z='1.1'"
             f":x='iw/2-(iw/zoom/2)'"
             f":y='(ih-ih/zoom)*(on/{d_frames})'"
-            f":d={d_frames}:s={W}x{H}"
+            f":d={d_frames}:fps=30:s={W*2}x{H*2}"
         )
 
-    return f"{base_scale},{zp},{fps_filter}"
+    # Scale down from 2x back to 1x to smooth out any zoompan subpixel jitter
+    return f"{base_scale},{zp},scale={W}:{H},{fps_filter}"
 
 
 def search_stock_videos(keyword, orientation="landscape"):
@@ -2782,8 +2976,8 @@ hr {
 </style>
 """, unsafe_allow_html=True)
 
-tab_main, tab_veo, tab_creative, tab_publish, tab_settings = st.tabs(
-    ["🎬 Pipeline", "🤖 Veo3 Studio", "🎨 Creative Studio", "📣 Xuất bản", "⚙️ Settings"]
+tab_main, tab_veo, tab_creative, tab_longvideo, tab_shortvideo, tab_publish, tab_settings = st.tabs(
+    ["🎬 Pipeline", "🤖 Veo3 Studio", "🎨 Creative Studio", "📹 Video Dài", "⚡ Video Ngắn", "📣 Xuất bản", "⚙️ Settings"]
 )
 
 # ════════════════════════════════════════════════════════════
@@ -3094,7 +3288,9 @@ with tab_main:
             custom = st.text_area("Hoặc nhập mô tả chi tiết (tùy chỉnh)", placeholder="Ví dụ:\nChủ đề: 한국 집값\nNội dung chính:\n- ...\nTôn màu: ...", height=150, key=f"{new_mode}_custom_input")
         default_dur = 60 if new_mode in ("shorts", "veo3") else 600
         duration = st.number_input("⏱️ Tổng thời lượng (giây)", min_value=15, max_value=18000, value=default_dur, step=30, key=f"{new_mode}_total_duration", help="Nhập thời lượng video tính bằng giây (VD: 600 = 10 phút, 1800 = 30 phút)")
-        target_sec_per_scene = st.number_input("⏳ Nhịp độ 1 cảnh (giây)", min_value=3, max_value=30, value=7, key=f"{new_mode}_seconds_per_scene", help="Tăng số này nếu muốn AI viết câu thoại dài hơn, đỡ bị vụn vặt.")
+        # Shorts: 5s/cảnh tối ưu cho nhịp độ TikTok/Reels; video dài: 7s/cảnh
+        _default_sec_per_scene = 5 if new_mode in ("shorts", "veo3") else 7
+        target_sec_per_scene = st.number_input("⏳ Nhịp độ 1 cảnh (giây)", min_value=3, max_value=30, value=_default_sec_per_scene, key=f"{new_mode}_seconds_per_scene", help="Shorts: 4–6s/cảnh để nhịp nhanh. Video dài: 7–10s/cảnh để câu thoại đủ ý.")
         style = st.selectbox("🎭 Phong cách", ["educational","storytelling","listicle","documentary","motivational"])
 
         st.markdown("**🪝 Kiểu Hook (3 giây đầu)**")
@@ -3169,9 +3365,11 @@ with tab_main:
                 save_proj(proj)
 
             _valid_rates = ["0.8", "0.9", "1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.6", "1.7", "1.8", "2.0"]
-            _default_rate = st.session_state.get("tts_rate_slider") or cfg.get("tts_rate", "1.3")
+            # Korean TTS đọc chậm hơn tiếng Anh — mặc định 1.5x cho Shorts, 1.3x cho video dài
+            _ko_default_rate = "1.5" if new_mode in ("shorts", "veo3") else "1.3"
+            _default_rate = st.session_state.get("tts_rate_slider") or cfg.get("tts_rate", _ko_default_rate)
             if _default_rate not in _valid_rates:
-                _default_rate = "1.3"
+                _default_rate = _ko_default_rate
             tts_rate = st.select_slider(
                 "⚡ Tốc độ đọc",
                 options=_valid_rates,
@@ -3184,6 +3382,40 @@ with tab_main:
             _force_edge = True
             _allow_voice_fallback = False
             st.info("🔒 Khóa giọng Hàn: chọn giọng nào dùng đúng giọng đó; TTS lỗi sẽ dừng render.")
+        elif _ZEROTTS_OK and lang == "Vietnamese":
+            # ── ZeroTTS local engine ── ưu tiên khi available ────────────────
+            _zt_voices = _zt.list_display_voices()
+            _saved_voice = proj.get("voice_cfg_key")
+            _default_zt = _saved_voice if _saved_voice in _zt_voices else _zt_voices[0]
+            voice = st.selectbox(
+                "🔊 Giọng đọc (ZeroTTS — Local Offline)",
+                _zt_voices,
+                index=_zt_voices.index(_default_zt),
+                key="voice_zerotts_sel",
+                help="ZeroTTS: WER 1.03%, nhanh gấp 2× realtime, không cần internet sau khi tải model"
+            )
+            _valid_rates = ["0.8", "0.9", "1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.6", "1.7", "1.8", "2.0"]
+            _default_rate = st.session_state.get("tts_rate_slider") or cfg.get("tts_rate", "1.0")
+            if _default_rate not in _valid_rates:
+                _default_rate = "1.0"
+            tts_rate = st.select_slider(
+                "⚡ Tốc độ đọc",
+                options=_valid_rates,
+                value=_default_rate,
+                key="tts_rate_slider",
+                help="ZeroTTS không điều chỉnh tốc độ nội tại — giá trị này dùng cho metadata cache"
+            )
+            if tts_rate != cfg.get("tts_rate"):
+                cfg["tts_rate"] = tts_rate
+                save_cfg(cfg)
+            voice_cfg_key = voice
+            if voice_cfg_key != proj.get("voice_cfg_key"):
+                proj["voice_cfg_key"] = voice_cfg_key
+                save_proj(proj)
+            _force_edge = False
+            _allow_voice_fallback = False
+            st.caption("🔒 Khóa giọng ZeroTTS: lỗi sẽ dừng, không tự đổi voice")
+            st.info("⚡ ZeroTTS: offline · WER 1.03% · ~2× faster than realtime · 8 giọng Việt")
         elif _CAPCUT_OK:
             _lang_flag = {"Vietnamese": "🇻🇳", "English": "🇺🇸", "Korean": "🇰🇷", "Japanese": "🇯🇵"}.get(lang, "🇺🇸")
             _lang_code  = {"Vietnamese": "vi", "English": "en", "Korean": "ko", "Japanese": "ja"}.get(lang, "en")
@@ -3203,14 +3435,12 @@ with tab_main:
                 key=f"voice_capcut_sel_{_lang_code}",
                 help="Giọng CapCut AI chất lượng cao — không cần Edge TTS hay Groq"
             )
-            # Rate slider — Shorts nên dùng 1.3-1.6x để dồn nhiều nội dung
-            # Lấy giá trị từ session_state nếu đã có, không thì dùng default theo mode
+            # Rate slider — Shorts nên dùng 1.5x; video dài 1.0–1.2x
             _rate_key = "tts_rate_slider"
-            # Ưu tiên: session_state → cfg (persist qua restart) → default theo mode
             _valid_rates = ["0.8", "0.9", "1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.6", "1.7", "1.8", "2.0"]
-            _default_rate = st.session_state.get(_rate_key) or cfg.get("tts_rate", "1.3" if new_mode == "shorts" else "1.0")
+            _default_rate = st.session_state.get(_rate_key) or cfg.get("tts_rate", "1.5" if new_mode == "shorts" else "1.0")
             if _default_rate not in _valid_rates:
-                _default_rate = "1.3" if new_mode == "shorts" else "1.0"
+                _default_rate = "1.5" if new_mode == "shorts" else "1.0"
             tts_rate = st.select_slider(
                 "⚡ Tốc độ đọc",
                 options=["0.8", "0.9", "1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.6", "1.7", "1.8", "2.0"],
@@ -3338,6 +3568,20 @@ with tab_main:
         _has_bgm = bgm_file or _bgm_local_path
         bgm_vol = st.slider("🔊 Âm lượng nhạc nền", min_value=0.01, max_value=0.5, value=0.1, step=0.01) if _has_bgm else 0.1
 
+        tts_vol = st.slider(
+            "🎤 Âm lượng giọng đọc (TTS)",
+            min_value=1.0, max_value=3.0, value=1.5, step=0.1,
+            help="Tăng âm lượng giọng đọc toàn video. 1.0 = bình thường, 1.5 = to hơn 50%, 2.0 = gấp đôi. Nếu video nghe nhỏ, hãy tăng lên 1.8–2.0.",
+            key=f"{new_mode}_tts_vol"
+        )
+
+        intro_vol_boost = st.slider(
+            "📢 Boost âm lượng Hook (cảnh 1)",
+            min_value=1.0, max_value=3.0, value=1.5, step=0.1,
+            help="Tăng âm lượng giọng đọc của cảnh đầu tiên để giật sự chú ý người xem ngay từ giây 0. Tính chỉnh lấy theo tts_vol × boost này.",
+            key=f"{new_mode}_intro_vol_boost"
+        )
+
         output_name = st.text_input(
             "📁 Tên file video đầu ra",
             value=proj.get("output_name", ""),
@@ -3374,7 +3618,7 @@ with tab_main:
         def _build_export_prompt():
             _ep_topic  = custom.strip() or niche
             _ep_sc     = max(2, round(duration / target_sec_per_scene))
-            _wps_map   = {"Vietnamese": 3.8, "Korean": 2.2, "English": 2.2}
+            _wps_map   = {"Vietnamese": 3.8, "Korean": 1.8, "English": 2.2}  # Korean: 1.8 eojeol/s — slower per unit than English
             _min_map   = {"Vietnamese": 35,  "Korean": 18,  "English": 18}
             _base_wps  = _wps_map.get(lang, 2.2)
             _wps       = _base_wps * float(tts_rate)
@@ -3449,12 +3693,16 @@ with tab_main:
                 f'      "keyword": {_kw_ex},\n'
                 f'      "duration": {target_sec_per_scene},\n'
                 f'      "veo3_prompt": "Concise English visual prompt following the canonical format",\n'
+                f'      "imagePrompt": "Short English image-gen prompt (20–60 words). Photorealistic, cinematic. Describe the SUBJECT + MOOD + LIGHTING. No text, no logos. Used to generate a still image via AI (Imagen/Flux/Midjourney).",\n'
                 f'      "soundEffect": "none|whoosh|click|chime|deep_hit",\n'
+                f'      "tts_speed": {float(tts_rate):.1f},\n'
                 f'      "retention_note": "why viewer stays"\n'
                 f'    }}\n'
                 f'  ]\n'
                 f'}}\n\n'
                 f"soundEffect rules: \"whoosh\" = fast scene transition; \"click\" = slide/reveal; \"chime\" = positive/warm; \"deep_hit\" = shocking/tense; \"none\" = neutral/default. Pick the best match per scene mood.\n"
+                f"imagePrompt rules: Short (20–60 words), English only, photorealistic cinematic still image. MUST describe a concrete visual: person/object/scene + dramatic lighting + mood. Example: 'A worried Vietnamese man staring at stock market screen, red candlestick charts, dark office, dramatic side lighting, cinematic, hyperrealistic.' NO abstract concepts, no text overlay, no logos.\n"
+                f"tts_speed: reading speed for this scene (float 0.8–2.0). Use the global tts_rate ({float(tts_rate):.1f}) unless the scene needs a different pace (e.g. slower for emotional scenes, faster for rapid-fire facts).\n"
                 f"Write EXACTLY {_ep_sc} scenes (id 1 to {_ep_sc}). Each narration ~{_wpsc} words.\n"
                 f"Set \"duration\" = reading time in seconds (word_count / {round(_wps, 1):.1f} wps, min 3s, max {round(target_sec_per_scene * 1.5):.0f}s).\n"
                 f"Return ONLY the JSON."
@@ -3536,7 +3784,7 @@ with tab_main:
                                 "scenes":      _imp_scenes,
                             }
                             # ── Pre-populate proj["scenes"] để edit UI hoạt động ngay ──
-                            _wps_map_imp = {"Vietnamese": 3.8, "Korean": 2.2, "English": 2.2, "Japanese": 2.0}
+                            _wps_map_imp = {"Vietnamese": 3.8, "Korean": 1.8, "English": 2.2, "Japanese": 1.8}
                             _wps_imp = _wps_map_imp.get(_imp_lang, 2.2) * float(_imp_rate)
                             _tgt_imp = float(_imp_target)
                             _imp_built_scenes = []
@@ -3554,6 +3802,30 @@ with tab_main:
                                     else:
                                         _dur_raw = len(_txt.split()) / max(_wps_imp, 0.1)
                                     _dur = round(min(max(_dur_raw + 0.4, 3.0), _tgt_imp * 1.5), 1)
+                                # Đọc tốc độ đọc riêng của cảnh từ JSON (các alias phổ biến)
+                                _sc_speed_raw = (_sc.get("tts_speed") or _sc.get("reading_speed")
+                                                 or _sc.get("voice_speed"))
+                                _valid_rates_imp = ["0.8","0.9","1.0","1.1","1.2","1.3","1.4","1.5","1.6","1.7","1.8","2.0"]
+                                if _sc_speed_raw is not None:
+                                    try:
+                                        _sc_spd = float(_sc_speed_raw)
+                                        _sc_tts_speed = f"{min([0.8,0.9,1.0,1.1,1.2,1.3,1.4,1.5,1.6,1.7,1.8,2.0], key=lambda x: abs(x - _sc_spd)):.1f}"
+                                    except (TypeError, ValueError):
+                                        _sc_tts_speed = None
+                                else:
+                                    _sc_tts_speed = None  # None = dùng tốc độ chung của dự án
+                                # Đọc imagePrompt từ JSON nếu có (dùng cho Imagen thay vì keyword)
+                                _img_prompt_raw = (_sc.get("imagePrompt") or _sc.get("image_prompt") or "").strip() or None
+                                # Đọc imageEffect (alias: image_effect) + normalize tên khác nhau
+                                _ie_raw = (_sc.get("imageEffect") or _sc.get("image_effect") or "").strip()
+                                _ie_alias = {"slide_right":"pan_right","slide_left":"pan_left",
+                                             "slide_up":"pan_up","slide_down":"pan_down",
+                                             "ken_burns":"zoom_in","ken_burns_in":"zoom_in",
+                                             "ken_burns_out":"zoom_out","zoomin":"zoom_in",
+                                             "zoomout":"zoom_out","zoom":"zoom_in"}
+                                _ie_valid = {"zoom_in","zoom_out","pan_right","pan_left","pan_up","pan_down"}
+                                _ie_raw = _ie_alias.get(_ie_raw, _ie_raw)
+                                _img_effect_imp = _ie_raw if _ie_raw in _ie_valid else None
                                 _imp_built_scenes.append({
                                     "id":          _sc.get("id", _ii + 1),
                                     "section":     _sc.get("section", ""),
@@ -3561,9 +3833,12 @@ with tab_main:
                                     "word_count":  _sc.get("word_count", len(_txt.split())),
                                     "keyword":     _sc.get("keyword", _imp_topic),
                                     "veo3_prompt": _sc.get("veo3_prompt", f"Cảnh về {_imp_topic}, cinematic, 4K"),
+                                    "imagePrompt": _img_prompt_raw,
+                                    "imageEffect": _img_effect_imp,
                                     "soundEffect": _sc.get("soundEffect", "none") if _sc.get("soundEffect") in ("none", "whoosh", "click", "chime", "deep_hit") else "none",
                                     "retention_note": _sc.get("retention_note", ""),
                                     "estimated_tts_duration": _sc.get("estimated_tts_duration"),
+                                    "tts_speed":   _sc_tts_speed,
                                     "videoUrl":    None,
                                     "veo3Path":    None,
                                     "imageUrl":    None,
@@ -3587,6 +3862,10 @@ with tab_main:
                                 if _dk in st.session_state: del st.session_state[_dk]
                                 for _k in list(st.session_state.keys()):
                                     if _k.startswith(f"kw_trans_{_ci}_"): del st.session_state[_k]
+                                # Xóa widget keys để Streamlit đọc lại từ proj["scenes"] sau import
+                                for _wk in [f"img_effect_{_ci}", f"img_prompt_{_ci}",
+                                            f"veo3_{_ci}", f"kw_{_ci}", f"text_{_ci}"]:
+                                    if _wk in st.session_state: del st.session_state[_wk]
                             save_proj(st.session_state.proj)
                             if "_gpt_export_prompt" in st.session_state:
                                 del st.session_state["_gpt_export_prompt"]
@@ -3652,6 +3931,9 @@ with tab_main:
                         _txt = _sc_item.get("text", "")
                         st.markdown(f"**Cảnh {_si+1}:** {_txt[:120]}{'...' if len(_txt) > 120 else ''}")
                         st.caption(f"🔍 Keyword: `{_sc_item.get('keyword', '')}` | {_footage_badge}")
+                        _ip_preview = (_sc_item.get("imagePrompt") or "").strip()
+                        if _ip_preview:
+                            st.caption(f"🖼️ *Prompt ảnh:* {_ip_preview[:120]}{'...' if len(_ip_preview) > 120 else ''}")
                     with _c2:
                         _uploaded = st.file_uploader(
                             f"Video nền cảnh {_si+1}",
@@ -3675,6 +3957,7 @@ with tab_main:
                                 "text":        _sc_item.get("text", ""),
                                 "keyword":     _sc_item.get("keyword", niche),
                                 "veo3_prompt": _sc_item.get("veo3_prompt", ""),
+                                "imagePrompt": _sc_item.get("imagePrompt", "") or "",
                                 "videoUrl":    None,
                                 "veo3Path":    None,
                                 "imageUrl":    None,
@@ -3890,7 +4173,7 @@ with tab_main:
                     # Words per second by language (actual TTS playback speed):
                     # Vietnamese Edge TTS reads very fast (~3.8 wps)
                     # Korean/English ~2.2 wps
-                    _wps_map = {"Vietnamese": 3.8, "Korean": 2.2, "English": 2.2, "Japanese": 2.0}
+                    _wps_map = {"Vietnamese": 3.8, "Korean": 1.8, "English": 2.2, "Japanese": 1.8}
                     words_per_sec    = _wps_map.get(lang, 2.2) * rate_val
                     # Minimum words per scene varies by language (Vietnamese needs more to fill time)
                     _min_words_map   = {"Vietnamese": 35, "Korean": 18, "English": 18, "Japanese": 16}
@@ -4660,7 +4943,7 @@ with tab_main:
                             format_str = (
                                 f'{{"title":"viral title in {lang} (max 60 chars, curiosity-driven)","description":"SEO description in {lang}",'\
                                 f'"tags":["t1","t2"],"scenes":[{{"id":1,"text":"narration STRICTLY in {lang}",'\
-                                f'"keyword":{kw_example},"soundEffect":"none|whoosh|click|chime|deep_hit","retention_note":"why viewer stays"}}]}}'
+                                f'"keyword":{kw_example},"soundEffect":"none|whoosh|click|chime|deep_hit","tts_speed":{float(tts_rate):.1f},"retention_note":"why viewer stays"}}]}}'
                             )
                         else:
                             end_note = ("FINAL BATCH — close all loops, deliver the payoff, apply CTA." if is_last else "Keep 1 open loop at the end to pull viewer to the next scene.")
@@ -4674,7 +4957,7 @@ with tab_main:
                             )
                             format_str = (
                                 f'{{"scenes":[{{"id":{batch_start},"text":"narration STRICTLY in {lang}",'\
-                                f'"keyword":{kw_example},"soundEffect":"none|whoosh|click|chime|deep_hit","retention_note":"why viewer stays"}}]}}'
+                                f'"keyword":{kw_example},"soundEffect":"none|whoosh|click|chime|deep_hit","tts_speed":{float(tts_rate):.1f},"retention_note":"why viewer stays"}}]}}'
                             )
 
                         if lang == "Vietnamese":
@@ -4996,12 +5279,34 @@ with tab_main:
                                 used_pexels_urls.add(vid_url)
                         else:
                             veo3_path = None
+                        # Đọc tts_speed riêng của cảnh nếu AI trả về (ngược lại để None = dùng tốc độ chung)
+                        _sc_speed_ai_raw = sc_data.get("tts_speed")
+                        _sc_tts_speed_ai = None
+                        if _sc_speed_ai_raw is not None:
+                            try:
+                                _spd = float(_sc_speed_ai_raw)
+                                _sc_tts_speed_ai = f"{min([0.8,0.9,1.0,1.1,1.2,1.3,1.4,1.5,1.6,1.7,1.8,2.0], key=lambda x: abs(x - _spd)):.1f}"
+                            except (TypeError, ValueError):
+                                _sc_tts_speed_ai = None
+                        _ip_ai = (sc_data.get("imagePrompt") or sc_data.get("image_prompt") or "").strip() or None
+                        # Đọc imageEffect + normalize alias
+                        _ie_ai_raw = (sc_data.get("imageEffect") or sc_data.get("image_effect") or "").strip()
+                        _ie_ai_alias = {"slide_right":"pan_right","slide_left":"pan_left",
+                                        "slide_up":"pan_up","slide_down":"pan_down",
+                                        "ken_burns":"zoom_in","ken_burns_in":"zoom_in",
+                                        "ken_burns_out":"zoom_out","zoomin":"zoom_in","zoomout":"zoom_out"}
+                        _ie_ai_valid = {"zoom_in","zoom_out","pan_right","pan_left","pan_up","pan_down"}
+                        _ie_ai_raw = _ie_ai_alias.get(_ie_ai_raw, _ie_ai_raw)
+                        _img_effect_ai = _ie_ai_raw if _ie_ai_raw in _ie_ai_valid else None
                         scenes.append({
                             "id":          sc_data["id"],
                             "text":        sc_data["text"],
                             "keyword":     sc_data["keyword"],
                             "veo3_prompt": sc_data.get("veo3_prompt", ""),
+                            "imagePrompt": _ip_ai,
+                            "imageEffect": _img_effect_ai,
                             "soundEffect": sc_data.get("soundEffect", "none") if sc_data.get("soundEffect") in ("none", "whoosh", "click", "chime", "deep_hit") else "none",
+                            "tts_speed":   _sc_tts_speed_ai,
                             "videoUrl":    vid_url,
                             "veo3Path":    veo3_path,
                             "imageUrl":    img_url,
@@ -5043,7 +5348,7 @@ with tab_main:
                     # → Cần rebuild ở đây để STEP 2 (Footage) có dữ liệu để chạy.
                     if not scenes and script and script.get("scenes"):
                         log("🔄 Phát hiện JSON imported — đang khởi tạo scenes từ kịch bản...")
-                        _wps_map       = {"Vietnamese": 3.8, "Korean": 2.2, "English": 2.2}
+                        _wps_map       = {"Vietnamese": 3.8, "Korean": 1.8, "English": 2.2, "Japanese": 1.8}
                         _words_per_sec = _wps_map.get(lang, 2.2) * float(tts_rate)
 
                         for sc_data in script["scenes"]:
@@ -5051,22 +5356,48 @@ with tab_main:
                             if lang == "Vietnamese":
                                 _scene_text = normalize_vietnamese_tts(_scene_text)
                                 sc_data["text"] = _scene_text
+                            _ip_raw = (sc_data.get("imagePrompt") or sc_data.get("image_prompt") or "").strip() or None
+                            _ie_rb = (sc_data.get("imageEffect") or sc_data.get("image_effect") or "").strip()
+                            _ie_rb_alias = {"slide_right":"pan_right","slide_left":"pan_left",
+                                            "slide_up":"pan_up","slide_down":"pan_down",
+                                            "ken_burns":"zoom_in","ken_burns_in":"zoom_in",
+                                            "ken_burns_out":"zoom_out","zoomin":"zoom_in",
+                                            "zoomout":"zoom_out","zoom":"zoom_in"}
+                            _ie_rb_valid = {"zoom_in","zoom_out","pan_right","pan_left","pan_up","pan_down"}
+                            _ie_rb = _ie_rb_alias.get(_ie_rb, _ie_rb)
+                            _img_effect_rb = _ie_rb if _ie_rb in _ie_rb_valid else None
+                            # ── FIX: Ưu tiên đọc duration từ JSON gốc ──────────────────────────
+                            # JSON có thể chứa calculated_tts_duration (ước tính chính xác hơn),
+                            # duration (target gốc), hoặc target_duration.
+                            # Fallback cuối: tính theo wps.
+                            _sc_dur_json = (
+                                sc_data.get("calculated_tts_duration")
+                                or sc_data.get("target_duration")
+                                or sc_data.get("duration")
+                            )
+                            if _sc_dur_json and isinstance(_sc_dur_json, (int, float)) and 1.5 <= float(_sc_dur_json) <= 60:
+                                # Dùng calculated_tts_duration + 0.3s buffer; không nhỏ hơn target_sec_per_scene
+                                _sc_dur_calc = round(max(float(target_sec_per_scene), float(_sc_dur_json) + 0.3), 1)
+                            else:
+                                _sc_dur_calc = round(
+                                    max(float(target_sec_per_scene),
+                                        len(_scene_text.split()) / max(_words_per_sec, 0.1) + 0.4),
+                                    1
+                                )
                             scenes.append({
                                 "id":          sc_data.get("id", len(scenes) + 1),
                                 "text":        _scene_text,
                                 "keyword":     sc_data.get("keyword", niche),
                                 "veo3_prompt": sc_data.get("veo3_prompt", ""),
+                                "imagePrompt": _ip_raw,
+                                "imageEffect": _img_effect_rb,
                                 "soundEffect": sc_data.get("soundEffect", "none") if sc_data.get("soundEffect") in ("none", "whoosh", "click", "chime", "deep_hit") else "none",
                                 "videoUrl":    None,
                                 "veo3Path":    None,
                                 "imageUrl":    None,
                                 "audioDone":   False,
                                 "targetDur":   float(target_sec_per_scene),
-                                "duration":    round(
-                                    max(float(target_sec_per_scene),
-                                        len(_scene_text.split()) / max(_words_per_sec, 0.1) + 0.4),
-                                    1
-                                ),
+                                "duration":    _sc_dur_calc,
                             })
                         proj.update({"scenes": scenes, "lang": lang, "step": 1})
                         save_proj(proj)
@@ -5122,10 +5453,17 @@ with tab_main:
                             if use_ai_images and _current_gkey:
                                 log(f"  🎨 Tạo ảnh AI tĩnh cho cảnh {i+1}...")
                                 img_save = work / f"ai_img_s{i}.jpg"
-                                img_path, err = generate_scene_image_ai(_kw, _current_gkey, W, H, img_save)
+                                _img_prompt = (s.get("imagePrompt") or "").strip()
+                                img_path, err = generate_scene_image_ai(
+                                    _kw, _current_gkey, W, H, img_save,
+                                    image_prompt=_img_prompt
+                                )
                                 if img_path:
                                     scenes[i]["imageUrl"] = str(img_path)
-                                    log(f"  ✅ Đã tạo ảnh AI cho cảnh {i+1}")
+                                    if _img_prompt:
+                                        log(f"  ✅ Cảnh {i+1}: ảnh AI từ imagePrompt tùy chỉnh")
+                                    else:
+                                        log(f"  ✅ Cảnh {i+1}: ảnh AI từ keyword '{_kw}'")
                                     _visual_counter += 1
                                     continue
                                 else:
@@ -5184,6 +5522,8 @@ with tab_main:
                     for i, s in enumerate(scenes):
                         log(f"  TTS cảnh {i+1}/{len(scenes)}")
                         import hashlib
+                        # Tốc độ đọc riêng của cảnh (nếu có), ngược lại dùng tốc độ chung
+                        _sc_rate = s.get("tts_speed") or tts_rate
                         # v2 invalidates files previously cached under a CapCut
                         # voice name even though their actual audio came from Edge.
                         tts_text = (
@@ -5191,7 +5531,7 @@ with tab_main:
                             if lang == "Vietnamese" else s["text"]
                         )
                         hash_str = (
-                            f"tts-cache-v3|{tts_text}|{voice_cfg_key}|{tts_rate}|"
+                            f"tts-cache-v3|{tts_text}|{voice_cfg_key}|{_sc_rate}|"
                             f"force-edge={bool(_force_edge)}|fallback={bool(_allow_voice_fallback)}"
                         )
                         h = hashlib.md5(hash_str.encode()).hexdigest()[:12]
@@ -5226,7 +5566,7 @@ with tab_main:
                             srt_path.unlink(missing_ok=True)
                             result = tts(tts_text, voice_cfg_key,
                                          srt_out=str(srt_path) if show_sub else None,
-                                         rate=tts_rate,
+                                         rate=_sc_rate,
                                          allow_edge_fallback=_allow_voice_fallback)
                             if result and is_valid_audio(result):
                                 # Sleep đủ lâu để tránh ExceededConcurrentLimit ở cảnh 5+
@@ -5246,7 +5586,7 @@ with tab_main:
                                 retry_result, _ = tts_edge_with_timing(
                                     s["text"], edge_key, edge_audio,
                                     str(srt_path) if show_sub else None,
-                                    rate=tts_rate
+                                    rate=_sc_rate
                                 )
                                 if retry_result and is_valid_audio(retry_result):
                                     shutil.copy(retry_result, audio_path)
@@ -5347,6 +5687,7 @@ with tab_main:
                 # STEP 4: Render
                 log("🎞️ Render video...")
                 scene_mp4s = []
+                scene_is_img = []  # theo dõi cảnh nào là ảnh để xfade
                 used_urls_render = set(s.get("videoUrl") for s in scenes if s.get("videoUrl"))
 
                 for i, s in enumerate(scenes):
@@ -5397,6 +5738,12 @@ with tab_main:
                         str(s.get("videoTrimStart", 0.0)),
                         str(show_sub), str(sub_style), str(enable_transition),
                         str(W), str(H), str(voice_cfg_key), str(tts_rate),
+                        str(intro_vol_boost if i == 0 else 1.0),
+                        str(s.get("tts_speed", "")),
+                        # Hook 2 giây đầu
+                        str(s.get("hookQuestion", "")),
+                        str(s.get("hookBigText", "")),
+                        str(s.get("hookSfx", "")),
                     ]
                     _scene_hash = _hc.sha256("|".join(_scene_fp_parts).encode()).hexdigest()[:20]
                     _scene_hash_file = s_dir / ".scene_hash"
@@ -5409,6 +5756,9 @@ with tab_main:
                     ):
                         log(f"  ♻️ Cache hit cảnh {i+1} (hash={_scene_hash[:8]}) — skip render")
                         scene_mp4s.append(_cached_scene_out)
+                        # Đọc lại is_img từ vid_path của cache
+                        _cached_vid = s_dir / "video.mp4"
+                        scene_is_img.append(_cached_vid.exists() and is_image_file(str(_cached_vid)))
                         continue
                     # ──────────────────────────────────────────────────────────────────────
 
@@ -5454,7 +5804,7 @@ with tab_main:
                                 _retry_result = tts(
                                     s.get("text", ""), voice_cfg_key,
                                     srt_out=str(_inline_srt) if _inline_srt else None,
-                                    rate=tts_rate,
+                                    rate=s.get("tts_speed") or tts_rate,
                                     allow_edge_fallback=_allow_voice_fallback,
                                 )
                                 if _retry_result and Path(_retry_result).exists():
@@ -5495,10 +5845,12 @@ with tab_main:
                     # ── AUDIO: Trim/pad đúng `dur` giây và ép chuẩn Stereo/44100Hz ──
                     audio_path = s_dir / "audio_trimmed.aac"
                     if src_audio and src_audio.exists():
+                        # Cảnh đầu tiên: boost âm lượng để kéo sự chú ý ngay từ giây 0
+                        _vol_filter = f",volume={intro_vol_boost:.2f}" if (i == 0 and intro_vol_boost > 1.0) else ""
                         ffmpeg("-i", str(src_audio),
                                # Fade 35ms đủ đưa biên sóng về zero, không làm
                                # mất phụ âm/chữ đầu như fade dài 150ms.
-                               "-af", f"afade=t=in:st=0:d=0.035,apad=pad_dur={dur}",
+                               "-af", f"afade=t=in:st=0:d=0.035,apad=pad_dur={dur}{_vol_filter}",
                                "-t", str(dur),
                                "-c:a", "aac", "-ar", "44100", "-ac", "2", "-b:a", "128k", "-y", str(audio_path))
                     else:
@@ -5623,8 +5975,10 @@ with tab_main:
                     speed = min(2.0, aud_dur / dur) if aud_dur > dur else 1.0
 
                     # Transitions
-                    # Giảm fade xuống 0.15s để chỉ chớp mờ chuyển cảnh, không bị đen lâu
-                    v_fade = f",fade=t=in:st=0:d=0.15,fade=t=out:st={dur-0.15}:d=0.15" if enable_transition else ""
+                    # Ảnh: fade 0.4s để transition đủ mượt; video: 0.15s để không bị đen lâu
+                    _is_img_scene = has_vid and is_image_file(str(vid_path))
+                    _fd = 0.4 if _is_img_scene else 0.15
+                    v_fade = f",fade=t=in:st=0:d={_fd},fade=t=out:st={max(0.0, dur-_fd):.3f}:d={_fd}" if enable_transition else ""
                     def _sub_filter(ass_path):
                         """Return ass= FFmpeg filter string with properly escaped path."""
                         p = str(ass_path).replace("\\", "\\\\").replace(":", "\\:")
@@ -5730,8 +6084,9 @@ with tab_main:
                                  "-t", str(dur),
                                  "-c:v", "libx264", "-preset", "fast", "-crf", "22",
                                  "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+                                 "-af", f"apad=whole_dur={dur}",
                                  "-map", "0:v", "-map", "1:a",
-                                 "-shortest", "-y", str(base_out)]
+                                 "-y", str(base_out)]
                             )
                         else:
                             st.error(f"Cảnh {i+1} mất audio đã chuẩn hóa. Đã dừng render.")
@@ -5746,15 +6101,22 @@ with tab_main:
                                 "-t", str(dur),
                                 "-c:v", "libx264", "-preset", "fast", "-crf", "22",
                                 "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+                                "-af", f"apad=whole_dur={dur}",
                                 "-map", "0:v", "-map", "1:a",
-                                "-shortest", "-y", str(base_out)
+                                "-y", str(base_out)
                             ]
                         else:
                             st.error(f"Cảnh {i+1} mất audio đã chuẩn hóa. Đã dừng render.")
                             st.stop()
 
-                    # ── Tính fade filter string ──
-                    _fade_str = f",fade=t=in:st=0:d=0.15,fade=t=out:st={max(0.0, dur-0.15):.3f}:d=0.15" if enable_transition else ""
+                    # ── Tính fade filter string — ảnh dùng 0.4s, video 0.15s ──
+                    _fd = 0.4 if _is_img_scene else 0.15
+                    # Không dùng fade đen (dip to black) cho cảnh ảnh nếu bật transition,
+                    # vì cảnh ảnh sẽ dùng xfade crossfade ở bước ghép (ghép đúp sẽ gây chớp đen).
+                    if enable_transition and not _is_img_scene:
+                        _fade_str = f",fade=t=in:st=0:d={_fd},fade=t=out:st={max(0.0, dur-_fd):.3f}:d={_fd}"
+                    else:
+                        _fade_str = ""
 
                     # ── Quyết định chiến lược render ──
                     # has_srt = cần subtitle pass → luôn phải output pass 1 ra base_out
@@ -5807,40 +6169,235 @@ with tab_main:
                             shutil.move(str(sfx_out), str(out))
                             log(f"  🔊 Sound effect: {sfx_name}")
 
+                    # ── 🪝 Hook Overlay (chỉ cảnh đầu, i==0) ─────────────────────────────
+                    # Hiển thị chữ to nổi bật 2 giây đầu để giật mình khán giả
+                    _hook_q  = s.get("hookQuestion", "").strip()
+                    _hook_b  = s.get("hookBigText", "").strip()
+                    _hook_sfx = s.get("hookSfx", "none")
+                    if i == 0 and (_hook_q or _hook_b) and out.exists():
+                        try:
+                            _hook_out = s_dir / "scene_hook.mp4"
+                            # ── Chọn font fallback an toàn ──
+                            _font_candidates = [
+                                "/Library/Fonts/Arial Bold.ttf",
+                                "/Library/Fonts/Arial.ttf",
+                                "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+                                "/System/Library/Fonts/Supplemental/Arial.ttf",
+                                "/System/Library/Fonts/Helvetica.ttc",
+                                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                            ]
+                            _font_path = next((f for f in _font_candidates if Path(f).exists()), None)
+                            _font_arg = f":fontfile='{_font_path}'" if _font_path else ""
+
+                            # ── Tính vị trí text ──
+                            _cx = W // 2   # center X
+                            _q_y = int(H * 0.30)   # Câu hỏi sốc: 30% từ trên
+                            _b_y = int(H * 0.55)   # Chữ to phụ: 55% từ trên
+
+                            # ── Drawtext filter: flash trong 2 giây đầu ──
+                            # alpha(t): ramp in 0→0.3s, hold 0.3→1.7s, ramp out 1.7→2s
+                            _alpha_expr = (
+                                "if(lt(t,0.3), t/0.3,"
+                                " if(lt(t,1.7), 1.0,"
+                                " if(lt(t,2.0), (2.0-t)/0.3, 0)))"
+                            )
+                            # Scale font size với zoom-pulse: lớn nhất lúc 0.8s
+                            _q_size_expr = f"if(lt(t,0.8), {int(W*0.085)}*0.7 + {int(W*0.085)}*0.3*(t/0.8), {int(W*0.085)})"
+                            _b_size_base = int(W * 0.065)
+
+                            _vf_parts = []
+                            if _hook_q:
+                                _safe_q = _hook_q.replace("'", "\\'").replace(":", "\\:")
+                                _vf_parts.append(
+                                    f"drawtext=text='{_safe_q}'{_font_arg}"
+                                    f":fontsize={int(W*0.082)}:fontcolor=white"
+                                    f":bordercolor=black:borderw=4"
+                                    f":x=(w-text_w)/2:y={_q_y}"
+                                    f":alpha='{_alpha_expr}'"
+                                    f":enable='lt(t,2.0)'"
+                                )
+                            if _hook_b:
+                                _safe_b = _hook_b.replace("'", "\\'").replace(":", "\\:")
+                                _vf_parts.append(
+                                    f"drawtext=text='{_safe_b}'{_font_arg}"
+                                    f":fontsize={_b_size_base}:fontcolor=yellow"
+                                    f":bordercolor=red:borderw=3"
+                                    f":x=(w-text_w)/2:y={_b_y}"
+                                    f":alpha='{_alpha_expr}'"
+                                    f":enable='lt(t,2.0)'"
+                                )
+                            _vf_hook = ",".join(_vf_parts)
+
+                            # ── FFmpeg: overlay chữ (giữ audio nguyên) ──
+                            ffmpeg(
+                                "-i", str(out),
+                                "-vf", _vf_hook,
+                                "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+                                "-c:a", "copy",
+                                "-y", str(_hook_out)
+                            )
+                            if _hook_out.exists() and _hook_out.stat().st_size > 10000:
+                                shutil.move(str(_hook_out), str(out))
+                                log(f"  🪝 Hook overlay: '{_hook_q[:20]}…' + '{_hook_b[:20]}…'")
+
+                            # ── hookSfx: thêm âm giật mình tại t=0 ──
+                            _hook_sfx_valid = {"deep_hit", "whoosh", "horror", "slam"}
+                            if _hook_sfx and _hook_sfx != "none":
+                                # Dùng apply_sound_effect_to_scene với sfx deep_hit hoặc whoosh
+                                _sfx_map = {
+                                    "horror": "deep_hit",  # fallback sang deep_hit nếu chưa có horror
+                                    "slam":   "deep_hit",
+                                }
+                                _resolved_hook_sfx = _sfx_map.get(_hook_sfx, _hook_sfx)
+                                if _resolved_hook_sfx in ("deep_hit", "whoosh", "click", "chime"):
+                                    _hook_sfx_out = s_dir / "scene_hook_sfx.mp4"
+                                    _sfx_ok = apply_sound_effect_to_scene(out, _resolved_hook_sfx, _hook_sfx_out)
+                                    if _sfx_ok and _hook_sfx_out.exists():
+                                        shutil.move(str(_hook_sfx_out), str(out))
+                                        log(f"  🔊 Hook SFX: {_hook_sfx} → {_resolved_hook_sfx}")
+                        except Exception as _hook_err:
+                            log(f"  ⚠️ Hook overlay lỗi (bỏ qua): {_hook_err}")
+
                     # Ghi hash cache sau khi render thành công — lần sau sẽ skip
+
                     if out.exists() and out.stat().st_size > 10000:
                         try:
                             _scene_hash_file.write_text(_scene_hash)
                         except Exception:
                             pass
                     scene_mp4s.append(out)
+                    scene_is_img.append(_is_img_scene)
 
                 # Các scene đã được chuẩn hóa H.264/AAC cùng resolution/fps ở trên.
-                # Thử concat stream-copy trước (nhanh, không giảm chất lượng); nếu một
-                # project cũ có codec/timebase lệch thì fallback sang normalize encode.
-                concat_txt = work / "concat.txt"
-                concat_txt.write_text("\n".join(f"file '{p}'" for p in scene_mp4s))
+                # Nếu enable_transition và có cảnh ảnh → dùng xfade crossfade giữa cảnh ảnh liên tiếp.
+                # Ngược lại: thử concat stream-copy trước (nhanh, không giảm chất lượng).
                 raw_final = work / "final.mp4"
-                try:
-                    ffmpeg(
-                        "-f", "concat", "-safe", "0", "-i", str(concat_txt),
-                        "-map", "0:v", "-map", "0:a",
-                        "-c", "copy", "-movflags", "+faststart",
-                        "-y", str(raw_final)
+
+                # ── Helper: ghép N clips với xfade crossfade ──
+                def _concat_with_xfade(clips, is_img_flags, out_path, xfade_dur=0.35):
+                    """Ghép clips với xfade crossfade ở chỗ giao tiếp ảnh–ảnh hoặc ảnh–video.
+                    Trả về True nếu thành công."""
+                    n = len(clips)
+                    if n == 0:
+                        return False
+                    if n == 1:
+                        shutil.copy(clips[0], out_path)
+                        return True
+
+                    # Probe duration của từng clip
+                    durations = []
+                    for cp in clips:
+                        try:
+                            pb = subprocess.run(
+                                [FFMPEG, "-i", str(cp), "-f", "null", "-"],
+                                capture_output=True, text=True
+                            )
+                            dur_v = 0.0
+                            for ln in pb.stderr.split("\n"):
+                                if "Duration:" in ln:
+                                    ts = ln.split("Duration:")[1].split(",")[0].strip()
+                                    hh, mm, ss = ts.split(":")
+                                    dur_v = int(hh)*3600 + int(mm)*60 + float(ss)
+                                    break
+                            durations.append(max(dur_v, 1.0))
+                        except Exception:
+                            durations.append(5.0)
+
+                    # Xây dựng filter_complex cho xfade
+                    # Mỗi transition: nếu cảnh hiện tại HOẶC cảnh tiếp theo là ảnh → dùng xfade
+                    # Ngược lại → concat thô (xfade video song song rất nặng CPU)
+                    inputs = []
+                    for cp in clips:
+                        inputs.extend(["-i", str(cp)])
+
+                    filter_parts = []
+                    # Label đầu ra của mỗi clip: [v0],[v1],...
+                    v_labels = [f"[v{j}]" for j in range(n)]
+                    a_labels = [f"[a{j}]" for j in range(n)]
+                    # Map mỗi input → v/a label
+                    for j in range(n):
+                        filter_parts.append(f"[{j}:v]copy[v{j}]")
+                        filter_parts.append(f"[{j}:a]acopy[a{j}]")
+
+                    # Tính offset tích lũy và áp xfade từng cặp
+                    offset = durations[0] - xfade_dur
+                    cur_v = "[v0]"
+                    cur_a = "[a0]"
+                    _xfade_effects = ["fade", "dissolve", "smoothleft", "wipeleft", "slideleft"]
+                    for j in range(1, n):
+                        use_xfade = is_img_flags[j-1] or is_img_flags[j]
+                        next_v = f"[xv{j}]" if j < n-1 else "[vout]"
+                        next_a = f"[xa{j}]" if j < n-1 else "[aout]"
+                        if use_xfade:
+                            _xfx = _xfade_effects[j % len(_xfade_effects)]
+                            filter_parts.append(
+                                f"{cur_v}{v_labels[j]}xfade=transition={_xfx}:duration={xfade_dur}:offset={offset:.3f}{next_v}"
+                            )
+                            filter_parts.append(
+                                f"{cur_a}{a_labels[j]}acrossfade=d={xfade_dur}{next_a}"
+                            )
+                        else:
+                            filter_parts.append(
+                                f"{cur_v}{v_labels[j]}concat=n=2:v=1:a=0{next_v}"
+                            )
+                            filter_parts.append(
+                                f"{cur_a}{a_labels[j]}concat=n=2:v=0:a=1{next_a}"
+                            )
+                        cur_v = next_v
+                        cur_a = next_a
+                        if j < n-1:
+                            offset += durations[j] - xfade_dur
+
+                    fc = ";".join(filter_parts)
+                    try:
+                        ffmpeg(
+                            *inputs,
+                            "-filter_complex", fc,
+                            "-map", "[vout]", "-map", "[aout]",
+                            "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+                            "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+                            "-movflags", "+faststart",
+                            "-y", str(out_path)
+                        )
+                        return out_path.exists() and out_path.stat().st_size > 10000
+                    except Exception as _xfe:
+                        log(f"  ⚠️ xfade thất bại ({_xfe}), fallback sang concat thô...")
+                        return False
+
+                # ── Quyết định chiến lược ghép ──
+                _has_any_img = any(scene_is_img)
+                _xfade_ok = False
+                if enable_transition and _has_any_img and len(scene_mp4s) > 1:
+                    log("✨ Ghép scene với xfade crossfade (cảnh ảnh)...")
+                    _xfade_ok = _concat_with_xfade(
+                        scene_mp4s, scene_is_img, raw_final, xfade_dur=0.35
                     )
-                    log("⚡ Ghép scene bằng stream-copy (không encode lại).")
-                except Exception as copy_error:
-                    log(f"  ↪️ Stream-copy không tương thích ({copy_error}); đang encode chuẩn hóa...")
-                    ffmpeg(
-                        "-f", "concat", "-safe", "0", "-i", str(concat_txt),
-                        "-vf", f"fps=30,scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H}",
-                        "-vsync", "cfr",
-                        "-c:v", "libx264", "-preset", "fast", "-crf", "20",
-                        "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
-                        "-map", "0:v", "-map", "0:a",
-                        "-movflags", "+faststart",
-                        "-y", str(raw_final)
-                    )
+                    if _xfade_ok:
+                        log("✅ Ghép xfade thành công.")
+
+                if not _xfade_ok:
+                    concat_txt = work / "concat.txt"
+                    concat_txt.write_text("\n".join(f"file '{p}'" for p in scene_mp4s))
+                    try:
+                        ffmpeg(
+                            "-f", "concat", "-safe", "0", "-i", str(concat_txt),
+                            "-map", "0:v", "-map", "0:a",
+                            "-c", "copy", "-movflags", "+faststart",
+                            "-y", str(raw_final)
+                        )
+                        log("⚡ Ghép scene bằng stream-copy (không encode lại).")
+                    except Exception as copy_error:
+                        log(f"  ↪️ Stream-copy không tương thích ({copy_error}); đang encode chuẩn hóa...")
+                        ffmpeg(
+                            "-f", "concat", "-safe", "0", "-i", str(concat_txt),
+                            "-vf", f"fps=30,scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H}",
+                            "-vsync", "cfr",
+                            "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+                            "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+                            "-map", "0:v", "-map", "0:a",
+                            "-movflags", "+faststart",
+                            "-y", str(raw_final)
+                        )
 
                 # Mix background music — hỗ trợ cả upload lẫn local path
                 _effective_bgm = bgm_file or (_bgm_local_path and Path(_bgm_local_path).exists())
@@ -5858,7 +6415,7 @@ with tab_main:
                         cmd = [
                             "-i", str(raw_final),
                             "-stream_loop", "-1", "-i", str(bgm_path),
-                            "-filter_complex", f"[0:a]volume=1.0[a0];[1:a]volume={bgm_vol}[a1];[a0][a1]amix=inputs=2:duration=first:dropout_transition=2[a]",
+                            "-filter_complex", f"[0:a]volume={tts_vol:.2f}[a0];[1:a]volume={bgm_vol}[a1];[a0][a1]amix=inputs=2:duration=first:dropout_transition=2[a]",
                             "-map", "0:v", "-map", "[a]",
                             "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-ar", "44100",
                             "-y", str(final_with_bgm)
@@ -5868,6 +6425,21 @@ with tab_main:
                         log("✅ Đã mix nhạc nền xong.")
                     except Exception as e:
                         log(f"⚠️ Lỗi mix nhạc nền: {e}, giữ nguyên gốc.")
+
+                # Không có BGM nhưng tts_vol > 1.0 → áp dụng volume filter riêng
+                elif tts_vol > 1.0:
+                    try:
+                        _tts_vol_out = work / "final_tts_vol.mp4"
+                        ffmpeg(
+                            "-i", str(raw_final),
+                            "-af", f"volume={tts_vol:.2f}",
+                            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-ar", "44100",
+                            "-y", str(_tts_vol_out)
+                        )
+                        raw_final = _tts_vol_out
+                        log(f"🔊 Đã tăng âm lượng giọng đọc ×{tts_vol:.1f}")
+                    except Exception as e:
+                        log(f"⚠️ Lỗi tăng âm lượng TTS: {e}, giữ nguyên gốc.")
 
                 # Use the requested output name when supplied; otherwise use the AI title.
                 title = proj.get("script", {}).get("title", "") or ""
@@ -6238,6 +6810,15 @@ with tab_main:
                     is_expanded = True if view_mode == "Tập trung (Mượt nhất)" else (idx == scenes_to_render[0][0])
                     
                     with st.expander(f"{label_emoji} Cảnh {idx+1}: {scene.get('text', '')[:40]}... ⏱️{scene.get('duration',5)}s", expanded=is_expanded):
+                        # ── Badge số cảnh — to rõ, luôn hiện đầu tiên ──
+                        st.markdown(
+                            f"<div style='background:#1e3a5f;border-left:4px solid #4a9eff;"
+                            f"padding:8px 14px;border-radius:6px;margin-bottom:10px;'>"
+                            f"<span style='font-size:20px;font-weight:bold;color:#4a9eff'>🎬 CẢNH {idx+1}</span>"
+                            f"<span style='color:#888;font-size:14px;margin-left:10px'>/ {total_scenes} cảnh</span>"
+                            f"</div>",
+                            unsafe_allow_html=True
+                        )
                         if note:
                             st.caption(f"💡 *Mục tiêu cảnh: {note}*")
                             
@@ -6322,6 +6903,79 @@ with tab_main:
                                         proj["scenes"][idx]["veo3Error"] = str(_veo_exc)[:300]
                                         save_proj(proj)
                                         st.error(f"Veo 3 lỗi: {_veo_exc}")
+
+                            # ── 🖼️ Image Prompt (cho AI Image mode — video dài chỉ dùng ảnh) ──
+                            st.markdown("**🖼️ Prompt Ảnh AI (Imagen / Flux / Midjourney):**")
+                            st.caption("Mô tả ảnh tĩnh cần tạo (tiếng Anh, 20–60 từ). Dùng khi chạy chế độ **AI Image**. Để trống → dùng Keyword.")
+                            _img_col1, _img_col2, _img_col3 = st.columns([5, 1, 1])
+                            with _img_col1:
+                                _curr_img_prompt = scene.get("imagePrompt", "")
+                                _new_img_prompt = st.text_area(
+                                    "imagePrompt_label",
+                                    value=_curr_img_prompt,
+                                    key=f"img_prompt_{idx}",
+                                    height=100,
+                                    label_visibility="collapsed",
+                                    placeholder="Ví dụ: A worried Vietnamese man staring at stock charts on monitor, dark dramatic office, red glow, cinematic, hyperrealistic..."
+                                )
+                                if _new_img_prompt != _curr_img_prompt:
+                                    proj["scenes"][idx]["imagePrompt"] = _new_img_prompt
+                                    edited = True
+                            with _img_col2:
+                                if st.button("✨ AI Viết\nPrompt Ảnh", key=f"gen_img_p_{idx}", use_container_width=True,
+                                             help="AI tự viết prompt ảnh chuẩn cho Imagen/Flux dựa trên nội dung cảnh"):
+                                    with st.spinner("AI đang viết prompt ảnh..."):
+                                        _sc_text = scene.get("text", "")
+                                        _kw_txt = scene.get("keyword", "")
+                                        _gen_img_p_prompt = (
+                                            f"Scene narration: \"{_sc_text[:300]}\"\n"
+                                            f"Keyword: {_kw_txt}\n\n"
+                                            "Write a SHORT English image generation prompt (20-60 words) for AI image tools (Imagen, Flux, Midjourney).\n"
+                                            "MUST: concrete visual subject + dramatic mood + lighting style. Photorealistic, cinematic.\n"
+                                            "FORBIDDEN: abstract ideas, text overlay, logos, brand names.\n"
+                                            "Reply with ONLY the prompt text. No explanation."
+                                        )
+                                        try:
+                                            _ai_img_p = call_ai(_gen_img_p_prompt).strip().strip('"').strip("'")
+                                            if _ai_img_p:
+                                                proj["scenes"][idx]["imagePrompt"] = _ai_img_p
+                                                save_proj(proj)
+                                                st.success("✅ Đã tạo prompt ảnh!")
+                                                st.rerun(scope="fragment")
+                                        except Exception as _e_ip:
+                                            st.error(f"Lỗi: {_e_ip}")
+                            with _img_col3:
+                                _gemini_key_ui = proj.get("gemini_key") or st.session_state.get("gemini_key", "")
+                                if st.button("🎨 Gen Ảnh\nNgay", key=f"gen_img_now_{idx}",
+                                             use_container_width=True, help="Tạo ảnh AI cho cảnh này ngay lập tức bằng Imagen 3"):
+                                    if not _gemini_key_ui:
+                                        st.error("Cần Gemini API Key")
+                                    else:
+                                        with st.spinner(f"Imagen 3 đang tạo ảnh cảnh {idx+1}..."):
+                                            try:
+                                                _W_ui = proj.get("W", 1080)
+                                                _H_ui = proj.get("H", 1920)
+                                                _img_save_ui = Path(str(proj.get("work_dir", TMP))) / f"s{idx}" / f"ai_img_manual_{idx}.jpg"
+                                                _img_save_ui.parent.mkdir(parents=True, exist_ok=True)
+                                                _ip_val = proj["scenes"][idx].get("imagePrompt", "").strip()
+                                                _kw_val = clean_keyword(scene.get("keyword", ""), lang=proj.get("lang", "Vietnamese"))
+                                                _p, _e = generate_scene_image_ai(
+                                                    _kw_val, _gemini_key_ui, _W_ui, _H_ui, _img_save_ui,
+                                                    image_prompt=_ip_val
+                                                )
+                                                if _p:
+                                                    proj["scenes"][idx]["imageUrl"] = str(_p)
+                                                    proj["scenes"][idx]["videoUrl"] = None
+                                                    proj["scenes"][idx]["customVid"] = None
+                                                    proj["scenes"][idx]["customImg"] = None
+                                                    proj["scenes"][idx]["veo3Path"] = None
+                                                    save_proj(proj)
+                                                    st.success(f"✅ Đã tạo ảnh AI cho cảnh {idx+1}!")
+                                                    st.rerun(scope="fragment")
+                                                else:
+                                                    st.error(f"❌ Lỗi tạo ảnh: {_e}")
+                                            except Exception as _e_gn:
+                                                st.error(f"❌ {_e_gn}")
 
                             # Gemini Web mode: use the user's existing Google AI
                             # subscription with an explicit human confirmation,
@@ -6980,6 +7634,55 @@ with tab_main:
                                         key=f"trim_start_{idx}"
                                     )
 
+                            # ── 🪝 HOOK 2 giây đầu (chỉ cảnh 1) ──────────────────────────────
+                            if idx == 0:
+                                st.markdown("---")
+                                st.markdown("### 🪝 Hook 2 Giây Đầu — Giữ Chân Người Xem")
+                                st.caption("Hiển thị chữ to nổi bật trong 2 giây đầu để giật mình khán giả. Để trống nếu không dùng.")
+                                _hook_col1, _hook_col2 = st.columns(2)
+                                with _hook_col1:
+                                    _curr_hook_q = scene.get("hookQuestion", "")
+                                    _new_hook_q = st.text_input(
+                                        "❓ Câu hỏi sốc (dòng 1 — chữ to):",
+                                        value=_curr_hook_q,
+                                        key=f"hook_q_{idx}",
+                                        placeholder="Ví dụ: Bạn có biết điều này?",
+                                        help="Câu hỏi giật mình xuất hiện to ở đầu cảnh, kèm hiệu ứng zoom-flash"
+                                    )
+                                with _hook_col2:
+                                    _curr_hook_b = scene.get("hookBigText", "")
+                                    _new_hook_b = st.text_input(
+                                        "🔥 Chữ nổi to (dòng 2 — màu vàng):",
+                                        value=_curr_hook_b,
+                                        key=f"hook_b_{idx}",
+                                        placeholder="Ví dụ: SỰ THẬT KINH HOÀNG!",
+                                        help="Chữ phụ màu vàng/đỏ in hoa, rung lắc nhẹ phía dưới câu hỏi"
+                                    )
+                                _hook_sfx_labels = {
+                                    "none":      "🔇 Không có",
+                                    "deep_hit":  "💥 Deep Hit (GIẬT MÌNH — khuyên dùng)",
+                                    "whoosh":    "💨 Whoosh (chuyển cảnh nhanh)",
+                                    "horror":    "😱 Horror Sting (rùng rợn)",
+                                    "slam":      "🔔 Slam (mạnh, cứng)",
+                                }
+                                _curr_hook_sfx = scene.get("hookSfx", "deep_hit")
+                                if _curr_hook_sfx not in _hook_sfx_labels: _curr_hook_sfx = "deep_hit"
+                                _new_hook_sfx = st.selectbox(
+                                    "🔊 Âm thanh giật mình đầu video:",
+                                    options=list(_hook_sfx_labels.keys()),
+                                    format_func=lambda x: _hook_sfx_labels[x],
+                                    index=list(_hook_sfx_labels.keys()).index(_curr_hook_sfx),
+                                    key=f"hook_sfx_{idx}",
+                                    help="Âm thanh phát ngay đầu cảnh cùng lúc với chữ nổi để tạo cú sốc tâm lý"
+                                )
+                                if (_new_hook_q != scene.get("hookQuestion", "") or
+                                    _new_hook_b != scene.get("hookBigText", "") or
+                                    _new_hook_sfx != scene.get("hookSfx", "deep_hit")):
+                                    proj["scenes"][idx]["hookQuestion"] = _new_hook_q
+                                    proj["scenes"][idx]["hookBigText"] = _new_hook_b
+                                    proj["scenes"][idx]["hookSfx"] = _new_hook_sfx
+                                    edited = True
+
                             st.markdown("---")
                             # ── Sound Effect ──
                             sfx_labels = {
@@ -7048,6 +7751,30 @@ with tab_main:
                             )
                             if _new_spd != scene.get("videoSpeed", 1.0):
                                 proj["scenes"][idx]["videoSpeed"] = _new_spd
+                                edited = True
+
+                            # ── TTS Speed Control (per-scene reading speed) ──
+                            _tts_rate_opts = ["0.8","0.9","1.0","1.1","1.2","1.3","1.4","1.5","1.6","1.7","1.8","2.0"]
+                            # Giá trị hiện tại: ưu tiên tts_speed riêng cảnh → tốc độ chung dự án
+                            _curr_sc_rate = scene.get("tts_speed") or tts_rate
+                            if _curr_sc_rate not in _tts_rate_opts: _curr_sc_rate = tts_rate
+                            _new_sc_rate = st.select_slider(
+                                "🗣️ Tốc độ đọc cảnh này (TTS):",
+                                options=_tts_rate_opts,
+                                value=_curr_sc_rate,
+                                key=f"sc_tts_speed_{idx}",
+                                help=f"Điều chỉnh tốc độ đọc riêng cho cảnh này. Mặc định dùng tốc độ chung ({tts_rate}x). Thay đổi sẽ tạo lại audio khi render."
+                            )
+                            if _new_sc_rate != scene.get("tts_speed"):
+                                # Nếu chọn đúng tốc độ chung → xóa trường tts_speed (để thừa kế)
+                                if _new_sc_rate == tts_rate:
+                                    proj["scenes"][idx].pop("tts_speed", None)
+                                else:
+                                    proj["scenes"][idx]["tts_speed"] = _new_sc_rate
+                                # Xóa cache audio để render lại với tốc độ mới
+                                proj["scenes"][idx].pop("audioFile", None)
+                                proj["scenes"][idx].pop("audioDur", None)
+                                proj["scenes"][idx].pop("audioCacheKey", None)
                                 edited = True
 
                             # ── Nút Render đơn cảnh ─────────────────────────────────────────
@@ -7217,7 +7944,8 @@ with tab_main:
                                                 "-vf", _scale_r, "-t", str(_dur_r),
                                                 "-c:v", "libx264", "-preset", "fast", "-crf", "22",
                                                 "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
-                                                "-map", "0:v", "-map", "1:a", "-shortest", "-y", str(_base_r)
+                                                "-af", f"apad=whole_dur={_dur_r}",
+                                                "-map", "0:v", "-map", "1:a", "-y", str(_base_r)
                                             ]
                                         else:
                                             _black_r = f"color=c=black:s={_W_r}x{_H_r}:r=30"
@@ -7225,7 +7953,8 @@ with tab_main:
                                                 "-f","lavfi","-i",_black_r,"-i",str(_audio_trim_r),
                                                 "-t",str(_dur_r),"-c:v","libx264","-preset","fast","-crf","22",
                                                 "-c:a","aac","-b:a","128k","-ar","44100",
-                                                "-map","0:v","-map","1:a","-shortest","-y",str(_base_r)
+                                                "-af",f"apad=whole_dur={_dur_r}",
+                                                "-map","0:v","-map","1:a","-y",str(_base_r)
                                             ]
                                         ffmpeg(*_cmd_r)
 
@@ -7265,6 +7994,64 @@ with tab_main:
                                                 import shutil as _sh2
                                                 _sh2.copy(_base_r, _out_r)
 
+                                        # ── 🪝 Hook Overlay (đơn cảnh, idx==0) ──────────────────
+                                        if idx == 0:
+                                            _hk_q_r = _s.get("hookQuestion", "").strip()
+                                            _hk_b_r = _s.get("hookBigText", "").strip()
+                                            _hk_sfx_r = _s.get("hookSfx", "none")
+                                            if (_hk_q_r or _hk_b_r) and _out_r.exists():
+                                                try:
+                                                    import shutil as _sh_hk
+                                                    _fc_r = [
+                                                        "/Library/Fonts/Arial Bold.ttf",
+                                                        "/Library/Fonts/Arial.ttf",
+                                                        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+                                                        "/System/Library/Fonts/Supplemental/Arial.ttf",
+                                                        "/System/Library/Fonts/Helvetica.ttc",
+                                                    ]
+                                                    _fp_font = next((f for f in _fc_r if Path(f).exists()), None)
+                                                    _fa_r = f":fontfile='{_fp_font}'" if _fp_font else ""
+                                                    _q_y_r = int(_H_r * 0.30)
+                                                    _b_y_r = int(_H_r * 0.55)
+                                                    _alp_r = ("if(lt(t,0.3), t/0.3,"
+                                                               " if(lt(t,1.7), 1.0,"
+                                                               " if(lt(t,2.0), (2.0-t)/0.3, 0)))")
+                                                    _vfp_r = []
+                                                    if _hk_q_r:
+                                                        _sq_r = _hk_q_r.replace("'","\\'").replace(":","\\:")
+                                                        _vfp_r.append(
+                                                            f"drawtext=text='{_sq_r}'{_fa_r}"
+                                                            f":fontsize={int(_W_r*0.082)}:fontcolor=white"
+                                                            f":bordercolor=black:borderw=4"
+                                                            f":x=(w-text_w)/2:y={_q_y_r}"
+                                                            f":alpha='{_alp_r}':enable='lt(t,2.0)'"
+                                                        )
+                                                    if _hk_b_r:
+                                                        _sb_r = _hk_b_r.replace("'","\\'").replace(":","\\:")
+                                                        _vfp_r.append(
+                                                            f"drawtext=text='{_sb_r}'{_fa_r}"
+                                                            f":fontsize={int(_W_r*0.065)}:fontcolor=yellow"
+                                                            f":bordercolor=red:borderw=3"
+                                                            f":x=(w-text_w)/2:y={_b_y_r}"
+                                                            f":alpha='{_alp_r}':enable='lt(t,2.0)'"
+                                                        )
+                                                    _hk_tmp_r = _s_dir_r / "scene_hook_r.mp4"
+                                                    ffmpeg("-i", str(_out_r),
+                                                           "-vf", ",".join(_vfp_r),
+                                                           "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+                                                           "-c:a", "copy", "-y", str(_hk_tmp_r))
+                                                    if _hk_tmp_r.exists() and _hk_tmp_r.stat().st_size > 10000:
+                                                        _sh_hk.move(str(_hk_tmp_r), str(_out_r))
+                                                    if _hk_sfx_r and _hk_sfx_r != "none":
+                                                        _smap_r = {"horror": "deep_hit", "slam": "deep_hit"}
+                                                        _res_sfx_r = _smap_r.get(_hk_sfx_r, _hk_sfx_r)
+                                                        if _res_sfx_r in ("deep_hit", "whoosh", "click", "chime"):
+                                                            _hsfx_tmp = _s_dir_r / "scene_hsfx_r.mp4"
+                                                            if apply_sound_effect_to_scene(_out_r, _res_sfx_r, _hsfx_tmp):
+                                                                _sh_hk.move(str(_hsfx_tmp), str(_out_r))
+                                                except Exception as _hke_r:
+                                                    st.warning(f"Hook overlay lỗi: {_hke_r}")
+
                                         # Ghi hash cache
                                         import hashlib as _hcr
                                         _fp_r = "|".join([
@@ -7277,6 +8064,10 @@ with tab_main:
                                             str(_s.get("videoTrimMode","")), str(_s.get("videoTrimStart",0.0)),
                                             str(_show_sub_r), str(_sub_style_r), str(_enable_trans_r),
                                             str(_W_r), str(_H_r), str(_voice_r), str(_rate_r),
+                                            str(_s.get("tts_speed", "")),
+                                            str(_s.get("hookQuestion", "")),
+                                            str(_s.get("hookBigText", "")),
+                                            str(_s.get("hookSfx", "")),
                                         ])
                                         _hash_file_r.write_text(_hcr.md5(_fp_r.encode()).hexdigest()[:16])
 
@@ -7318,7 +8109,15 @@ with tab_main:
                                         new_start if new_mode == "custom" else 0.0
                                     )
                                 )
-                                    
+
+                            # ── Badge số cảnh cuối khung ──
+                            st.markdown(
+                                f"<div style='text-align:center;color:#555;font-size:12px;margin-top:8px'>"
+                                f"— CẢNH {idx+1} / {total_scenes} —"
+                                f"</div>",
+                                unsafe_allow_html=True,
+                            )
+
                         if (new_text != scene.get('text') or 
                             new_kw != scene.get('keyword') or 
                             new_dur != scene.get('duration') or 
@@ -7435,6 +8234,1313 @@ with tab_main:
         elif proj.get("step",0) == 0 and not run_all:
             st.info("👈 Chọn cấu hình bên trái và bấm **Bắt Đầu Tự Động**\n\nSettings → thêm API keys trước")
 
+
+# ════════════════════════════════════════════════════════════
+# VIDEO DÀI TAB — standalone, không đụng proj/Pipeline cũ
+# ════════════════════════════════════════════════════════════
+with tab_longvideo:
+    st.header("📹 Video Dài — Auto Pipeline")
+    st.caption("Tạo video dài từ 100+ cảnh hoàn toàn tự động. Độc lập với Pipeline chính.")
+
+    # ── Helper: extract scene number from filename ────────────────────────────
+    def _lv_scene_num(fname: str):
+        """Trả về số cảnh từ tên file dạng scene_001_xxx.jpg → 1. None nếu không có."""
+        m = re.search(r'scene[_\-]?(\d+)', fname, re.IGNORECASE)
+        return int(m.group(1)) if m else None
+
+    def _lv_match_images(uploaded_files, n_scenes):
+        """
+        Phân phối ảnh upload vào đúng cảnh dựa trên scene_NNN trong tên file.
+        Fallback: gán theo thứ tự nếu không có số.
+        Trả về dict {scene_idx (0-based): UploadedFile or None}
+        """
+        result = {i: None for i in range(n_scenes)}
+        no_num = []
+        for f in uploaded_files:
+            n = _lv_scene_num(f.name)
+            if n is not None:
+                idx = n - 1  # 0-based
+                if 0 <= idx < n_scenes:
+                    result[idx] = f
+            else:
+                no_num.append(f)
+        # Fallback: ảnh không có số → gán vào cảnh chưa có ảnh theo thứ tự
+        leftover_slots = [i for i in range(n_scenes) if result[i] is None]
+        for f, slot in zip(no_num, leftover_slots):
+            result[slot] = f
+        return result
+
+    # ── Session state keys (tất cả prefix lv_) ───────────────────────────────
+    if "lv_scenes" not in st.session_state:
+        st.session_state.lv_scenes = []
+    if "lv_title" not in st.session_state:
+        st.session_state.lv_title = ""
+    if "lv_lang" not in st.session_state:
+        st.session_state.lv_lang = "Korean"
+    if "lv_aspect" not in st.session_state:
+        st.session_state.lv_aspect = "16:9"
+    if "lv_tts_rate" not in st.session_state:
+        st.session_state.lv_tts_rate = "1.3"
+    if "lv_render_log" not in st.session_state:
+        st.session_state.lv_render_log = []
+    if "lv_final_path" not in st.session_state:
+        st.session_state.lv_final_path = None
+
+    # ════════ A. IMPORT JSON ═════════════════════════════════════════════════
+    st.subheader("① Nhập JSON kịch bản")
+    lv_json_raw = st.text_area(
+        "Paste JSON (có field scenes[]):",
+        height=150,
+        placeholder='{"video_config": {...}, "scenes": [{"id":1,"text":"...","duration":5,...}]}',
+        key="lv_json_input"
+    )
+    col_load, col_clear = st.columns([1, 1])
+    with col_load:
+        if st.button("📥 Load JSON", key="lv_btn_load", use_container_width=True):
+            try:
+                _lv_data = json.loads(lv_json_raw)
+                _lv_sc = _lv_data.get("scenes") or _lv_data.get("Scenes") or []
+                if not _lv_sc:
+                    st.error("Không tìm thấy field 'scenes' trong JSON.")
+                else:
+                    st.session_state.lv_scenes = _lv_sc
+                    _vc = _lv_data.get("video_config", {})
+                    st.session_state.lv_title = _lv_data.get("title", _vc.get("topic", "video_dai"))
+                    st.session_state.lv_lang  = _vc.get("language", "Korean")
+                    st.session_state.lv_aspect = _vc.get("aspect_ratio", "16:9")
+                    _spd = str(_vc.get("tts_speed") or _vc.get("tts_rate") or "1.3")
+                    st.session_state.lv_tts_rate = _spd
+                    st.session_state.lv_final_path = None
+                    st.session_state.lv_render_log = []
+                    st.success(f"✅ Đã load {len(_lv_sc)} cảnh — tổng ~{sum(s.get('duration',5) for s in _lv_sc)}s")
+            except Exception as _e:
+                st.error(f"❌ Lỗi parse JSON: {_e}")
+    with col_clear:
+        if st.button("🗑️ Xóa", key="lv_btn_clear", use_container_width=True):
+            st.session_state.lv_scenes = []
+            st.session_state.lv_final_path = None
+            st.session_state.lv_render_log = []
+            st.rerun()
+
+    lv_scenes = st.session_state.lv_scenes
+    n_lv = len(lv_scenes)
+
+    if n_lv > 0:
+        # Preview bảng cảnh
+        with st.expander(f"📋 Preview {n_lv} cảnh (tổng ~{sum(s.get('duration',5) for s in lv_scenes)}s = {sum(s.get('duration',5) for s in lv_scenes)//60}m{sum(s.get('duration',5) for s in lv_scenes)%60}s)", expanded=False):
+            _tbl_data = []
+            for _si, _sc in enumerate(lv_scenes):
+                _ie = (_sc.get("imageEffect") or _sc.get("image_effect") or "random")
+                _tbl_data.append({
+                    "#": _si + 1,
+                    "Text (40 chars)": str(_sc.get("text",""))[:40],
+                    "Dur": _sc.get("duration", 5),
+                    "Effect": _ie,
+                    "imagePrompt": str(_sc.get("imagePrompt",""))[:50],
+                })
+            st.dataframe(_tbl_data, use_container_width=True, height=300)
+
+        st.divider()
+
+        # ════════ B. UPLOAD ẢNH ══════════════════════════════════════════════
+        st.subheader("② Upload ảnh cho các cảnh")
+        st.caption("Đặt tên file dạng `scene_001_xxx.jpg`, `scene_002_xxx.jpg`... Tool sẽ tự phân phối đúng cảnh.")
+
+        # Khởi tạo counter để reset uploader
+        if "lv_img_uploader_key" not in st.session_state:
+            st.session_state["lv_img_uploader_key"] = 0
+
+        _lv_up_col1, _lv_up_col2 = st.columns([6, 1])
+        with _lv_up_col1:
+            lv_uploaded_imgs = st.file_uploader(
+                f"Upload ảnh (tối đa {n_lv} file, đặt tên scene_NNN_...):",
+                type=["jpg","jpeg","png","webp"],
+                accept_multiple_files=True,
+                key=f"lv_img_uploader_{st.session_state['lv_img_uploader_key']}"
+            )
+        with _lv_up_col2:
+            st.write("")
+            st.write("")
+            if st.button("🗑️ Xóa hết", key="lv_clear_imgs", help="Xóa toàn bộ ảnh đã upload", use_container_width=True):
+                st.session_state["lv_img_uploader_key"] += 1
+                st.rerun()
+
+        lv_img_map = {}
+        if lv_uploaded_imgs:
+            lv_img_map = _lv_match_images(lv_uploaded_imgs, n_lv)
+            matched   = sum(1 for v in lv_img_map.values() if v is not None)
+            unmatched = n_lv - matched
+            st.success(f"✅ Khớp {matched}/{n_lv} cảnh với ảnh.")
+            if unmatched > 0:
+                st.warning(f"⚠️ {unmatched} cảnh chưa có ảnh → sẽ tạo tự động bằng Imagen 3 (cần API key Gemini).")
+
+            # Bảng mapping xác nhận
+            with st.expander("📌 Xem bảng phân phối ảnh → cảnh", expanded=False):
+                _map_rows = []
+                for _mi in range(n_lv):
+                    _f = lv_img_map.get(_mi)
+                    _map_rows.append({
+                        "Cảnh": _mi + 1,
+                        "Text": str(lv_scenes[_mi].get("text",""))[:30],
+                        "File ảnh": _f.name if _f else "—",
+                        "Status": "✅ Khớp" if _f else "🤖 Imagen/đen"
+                    })
+                st.dataframe(_map_rows, use_container_width=True)
+        else:
+            st.info("ℹ️ Chưa upload ảnh → toàn bộ cảnh sẽ dùng Imagen 3 (imagePrompt). Cần Gemini API key.")
+
+        st.divider()
+
+        # ════════ C. CONFIG ═══════════════════════════════════════════════════
+        st.subheader("③ Cấu hình")
+        _lv_c1, _lv_c2, _lv_c3 = st.columns(3)
+        with _lv_c1:
+            _lv_lang_flag = {"Vietnamese": "🇻🇳", "English": "🇺🇸", "Korean": "🇰🇷", "Japanese": "🇯🇵"}.get(st.session_state.lv_lang, "🇻🇳")
+            _lv_voice_opts = []
+            # ── ZeroTTS (ưu tiên đầu danh sách — local, offline, WER 1.03%) ─────
+            if _ZEROTTS_OK and _lv_lang_flag == "🇻🇳":
+                _lv_voice_opts.extend(_zt.list_display_voices())
+            # ── CapCut TTS ────────────────────────────────────────────────────────
+            if _CAPCUT_OK:
+                _lv_voice_opts.extend([k for k in _cc.CAPCUT_VOICES if _lv_lang_flag in k])
+            if _lv_lang_flag == "🇰🇷":
+                _lv_voice_opts.extend(KOREAN_EDGE_VOICES)
+            else:
+                _lv_voice_opts.extend(list(EDGE_VOICES.keys()))
+
+            # Default: ZeroTTS Mai Chi nếu có, không thì CapCut cũ
+            _lv_def_idx = 0
+            _lv_zt_default = "🇻🇳 Mai Chi — Nữ · Trẻ · Kể chuyện · Nhẹ nhàng · Thân thiện"
+            if _lv_zt_default in _lv_voice_opts:
+                _lv_def_idx = _lv_voice_opts.index(_lv_zt_default)
+            elif "🇻🇳 Giọng Nam Trầm" in _lv_voice_opts:
+                _lv_def_idx = _lv_voice_opts.index("🇻🇳 Giọng Nam Trầm")
+
+            lv_voice_key = st.selectbox(
+                "🎙️ Giọng TTS:",
+                options=_lv_voice_opts,
+                index=_lv_def_idx,
+                key="lv_voice",
+                help="⚡ ZeroTTS: offline · WER 1.03% · 8 giọng Việt có tag rõ ràng"
+            )
+        with _lv_c2:
+            lv_tts_rate = st.selectbox(
+                "⚡ Tốc độ TTS:",
+                options=["0.8","0.9","1.0","1.1","1.2","1.3","1.4","1.5","1.6","1.7","1.8","2.0"],
+                index=["0.8","0.9","1.0","1.1","1.2","1.3","1.4","1.5","1.6","1.7","1.8","2.0"].index(
+                    st.session_state.lv_tts_rate
+                ) if st.session_state.lv_tts_rate in ["0.8","0.9","1.0","1.1","1.2","1.3","1.4","1.5","1.6","1.7","1.8","2.0"] else 5,
+                key="lv_tts_rate_sel",
+                on_change=lambda: st.session_state.update({"lv_tts_rate": st.session_state["lv_tts_rate_sel"]})
+            )
+        with _lv_c3:
+            lv_aspect = st.selectbox(
+                "📐 Tỉ lệ:",
+                options=["16:9", "9:16", "1:1"],
+                index=["16:9","9:16","1:1"].index(st.session_state.lv_aspect) if st.session_state.lv_aspect in ["16:9","9:16","1:1"] else 0,
+                key="lv_aspect_sel"
+            )
+
+        # BGM
+        lv_bgm_file = st.file_uploader("🎵 Nhạc nền BGM (mp3/wav, tùy chọn):", type=["mp3","wav","m4a"], key="lv_bgm")
+        if lv_bgm_file:
+            lv_bgm_vol = st.slider("🔊 Volume BGM:", 0, 100, 20, key="lv_bgm_vol")
+        else:
+            lv_bgm_vol = 20
+
+        lv_out_name = st.text_input(
+            "💾 Tên file output:",
+            value=output_file_stem(st.session_state.lv_title) or "video_dai",
+            key="lv_out_name"
+        )
+        lv_out_dir = st.text_input(
+            "📂 Thư mục lưu video:",
+            value="/Users/zeworkcomputer/Documents/99999",
+            key="lv_out_dir",
+            help="Tool tự tạo nếu chưa có."
+        )
+
+        _lv_sub_c1, _lv_sub_c2, _lv_sub_c3 = st.columns([1, 2, 1])
+        with _lv_sub_c1:
+            lv_show_sub = st.checkbox("📝 Hiện subtitle", value=True, key="lv_show_sub")
+        with _lv_sub_c2:
+            lv_sub_style = st.selectbox(
+                "Style sub:",
+                options=list(SUB_STYLES.keys()),
+                index=0,
+                key="lv_sub_style",
+                disabled=not lv_show_sub
+            ) if lv_show_sub else list(SUB_STYLES.keys())[0]
+        with _lv_sub_c3:
+            lv_xfade_dur = st.slider("⏱️ Xfade (s):", 0.0, 1.0, 0.35, 0.05, key="lv_xfade_dur")
+
+        st.divider()
+
+        # ════════ D. RENDER ═══════════════════════════════════════════════════
+        st.subheader("④ Render Video")
+        _lv_total_dur = sum(s.get("duration", 5) for s in lv_scenes)
+        st.caption(f"Tổng thời lượng ước tính: **{_lv_total_dur}s = {_lv_total_dur//60}m{_lv_total_dur%60}s** | {n_lv} cảnh")
+
+        lv_do_render = st.button(
+            f"▶️ Tạo Video Dài ({n_lv} cảnh)",
+            key="lv_btn_render",
+            type="primary",
+            use_container_width=True,
+            disabled=(n_lv == 0)
+        )
+
+        if lv_do_render:
+            st.session_state.lv_render_log = []
+            st.session_state.lv_final_path = None
+
+            _lv_W, _lv_H = (1080, 1920) if "9:16" in lv_aspect else ((1080, 1080) if "1:1" in lv_aspect else (1920, 1080))
+            _lv_work_dir = AUDIO_DIR / f"lv_{uuid.uuid4().hex[:8]}"
+            _lv_work_dir.mkdir(parents=True, exist_ok=True)
+
+            # Save BGM nếu có
+            _lv_bgm_path = None
+            if lv_bgm_file:
+                _lv_bgm_path = _lv_work_dir / f"bgm_{lv_bgm_file.name}"
+                _lv_bgm_path.write_bytes(lv_bgm_file.read())
+
+            _lv_log_area = st.empty()
+            _lv_prog = st.progress(0, text="Đang chuẩn bị...")
+            _lv_scene_clips = []
+            _lv_transitions = []  # transition per boundary
+            _lv_errors = []
+
+            # ── Alias normalize image effect ─────────────────────────────────
+            _lv_ie_alias = {
+                "slide_right":"pan_right","slide_left":"pan_left",
+                "slide_up":"pan_up","slide_down":"pan_down",
+                "ken_burns":"zoom_in","ken_burns_in":"zoom_in",
+                "ken_burns_out":"zoom_out","zoomin":"zoom_in","zoomout":"zoom_out","zoom":"zoom_in"
+            }
+            _lv_ie_valid = {"zoom_in","zoom_out","pan_right","pan_left","pan_up","pan_down"}
+
+            def _lv_log(msg):
+                st.session_state.lv_render_log.append(msg)
+                _lv_log_area.text_area("📋 Log:", "\n".join(st.session_state.lv_render_log[-30:]), height=200, key=f"lv_log_{len(st.session_state.lv_render_log)}")
+
+            # ── Per-scene render loop ─────────────────────────────────────────
+            for _lv_i, _lv_sc in enumerate(lv_scenes):
+                _lv_pct = int((_lv_i) / n_lv * 90)
+                _lv_prog.progress(_lv_pct, text=f"Cảnh {_lv_i+1}/{n_lv}...")
+                _lv_log(f"━━ Cảnh {_lv_i+1}/{n_lv}: {str(_lv_sc.get('text',''))[:40]}...")
+
+                _lv_s_dir = _lv_work_dir / f"scene_{_lv_i:04d}"
+                _lv_s_dir.mkdir(exist_ok=True)
+                _lv_clip_out = _lv_s_dir / "clip.mp4"
+
+                try:
+                    # Step 1: TTS + SRT → words
+                    _lv_text = str(_lv_sc.get("text", "")).strip()
+                    _lv_dur  = float(_lv_sc.get("duration", 5))
+                    # UI global rate luôn được ưu tiên; per-scene tts_speed trong JSON chỉ dùng khi UI rate = default
+                    _lv_sc_rate = lv_tts_rate
+                    _lv_audio_path = _lv_s_dir / "tts.mp3"
+                    _lv_srt_path   = _lv_s_dir / "tts.srt"
+                    _lv_log(f"  🎙️ TTS ({_lv_sc_rate}x)...")
+                    _lv_words = []
+                    try:
+                        _tts_ret = tts(_lv_text, voice_cfg=lv_voice_key, srt_out=str(_lv_srt_path), rate=_lv_sc_rate)
+                        if _tts_ret and Path(_tts_ret).exists():
+                            shutil.move(_tts_ret, str(_lv_audio_path))
+                        if _lv_srt_path.exists() and _lv_srt_path.stat().st_size > 10:
+                            _lv_words = srt_to_words(str(_lv_srt_path))
+                            _lv_log(f"  ✅ TTS OK — {len(_lv_words)} words")
+                    except Exception as _te:
+                        _lv_log(f"  ⚠️ TTS lỗi: {_te} — dùng silence")
+                        ffmpeg("-f","lavfi","-i",f"anullsrc=r=44100:cl=mono","-t",str(_lv_dur),
+                               "-acodec","libmp3lame","-y",str(_lv_audio_path))
+
+                    # Fallback words từ text + duration
+                    if not _lv_words and _lv_text and _lv_audio_path.exists():
+                        try:
+                            _lv_pb = subprocess.run([FFMPEG,"-i",str(_lv_audio_path),"-f","null","-"],
+                                                    capture_output=True, text=True)
+                            _lv_ad = 0.0
+                            for _ll in _lv_pb.stderr.split("\n"):
+                                if "Duration:" in _ll:
+                                    _lts = _ll.split("Duration:")[1].split(",")[0].strip()
+                                    _lh,_lm,_ls = _lts.split(":")
+                                    _lv_ad = int(_lh)*3600+int(_lm)*60+float(_ls)
+                                    break
+                            if _lv_ad > 0:
+                                # Detect leading silence — find when speech actually starts
+                                _lv_speech_start = 0.0
+                                try:
+                                    _lv_sil = subprocess.run(
+                                        [FFMPEG, "-i", str(_lv_audio_path),
+                                         "-af", "silencedetect=noise=-35dB:d=0.05",
+                                         "-f", "null", "-"],
+                                        capture_output=True, text=True
+                                    )
+                                    for _sil_ln in _lv_sil.stderr.split("\n"):
+                                        if "silence_end:" in _sil_ln:
+                                            _lv_speech_start = float(_sil_ln.split("silence_end:")[1].split("|")[0].strip())
+                                            break
+                                except Exception:
+                                    pass
+                                _lv_speech_dur = max(0.1, _lv_ad - _lv_speech_start)
+                                _lv_toks = _lv_text.split()
+                                _lv_td = _lv_speech_dur / max(len(_lv_toks),1)
+                                _lv_words = [{"word":w,"start":_lv_speech_start+i*_lv_td,"end":_lv_speech_start+(i+1)*_lv_td} for i,w in enumerate(_lv_toks)]
+                                _lv_log(f"  📝 Fallback words: {len(_lv_words)} từ (speech_start={_lv_speech_start:.2f}s, speech_dur={_lv_speech_dur:.2f}s)")
+                        except Exception:
+                            pass
+
+                    # Step 1b: Subtitle ASS
+                    _lv_ass_path = None
+                    if lv_show_sub and HAS_SUB and _lv_words:
+                        try:
+                            _lv_ass_c = make_ass(_lv_words, W=_lv_W, H=_lv_H, style_name=lv_sub_style)
+                            if _lv_ass_c:
+                                _lv_ass_path = _lv_s_dir / "sub.ass"
+                                _lv_ass_path.write_text(_lv_ass_c, encoding="utf-8")
+                                _lv_log(f"  📝 Sub OK ({len(_lv_words)} words)")
+                        except Exception as _lv_asse:
+                            _lv_log(f"  ⚠️ Sub lỗi: {_lv_asse}")
+
+                    def _lv_ass_vf(ap):
+                        p = str(ap).replace("\\","\\\\").replace(":","\\:")
+                        return f",format=yuv420p,ass='{p}'"
+                    _lv_sub_vf = _lv_ass_vf(_lv_ass_path) if _lv_ass_path else ""
+
+                    # Step 2: Ảnh
+                    _lv_img_path = None
+                    _lv_up_f = lv_img_map.get(_lv_i) if lv_img_map else None
+                    if _lv_up_f is not None:
+                        # Dùng ảnh upload
+                        _lv_img_save = _lv_s_dir / f"img_{_lv_up_f.name}"
+                        _lv_img_save.write_bytes(_lv_up_f.read())
+                        _lv_img_path = _lv_img_save
+                        _lv_log(f"  🖼️ Ảnh: {_lv_up_f.name}")
+                    else:
+                        # Thử Imagen 3
+                        _lv_ip = (_lv_sc.get("imagePrompt") or _lv_sc.get("image_prompt") or "").strip()
+                        if _lv_ip and cfg.get("gemini_api_key","").strip():
+                            try:
+                                _lv_log(f"  🤖 Imagen 3...")
+                                _lv_img_url = generate_scene_image_ai(
+                                    keyword=_lv_sc.get("keyword",""),
+                                    image_prompt=_lv_ip,
+                                    aspect="16:9" if _lv_W > _lv_H else ("9:16" if _lv_H > _lv_W else "1:1")
+                                )
+                                if _lv_img_url:
+                                    _lv_img_dl = _lv_s_dir / "ai_img.jpg"
+                                    download_url(_lv_img_url, str(_lv_img_dl))
+                                    _lv_img_path = _lv_img_dl
+                                    _lv_log(f"  ✅ Imagen OK")
+                            except Exception as _ie2:
+                                _lv_log(f"  ⚠️ Imagen lỗi: {_ie2} — nền đen")
+                        else:
+                            _lv_log(f"  ⬛ Không có ảnh — nền đen")
+
+                    # Step 3: FFmpeg render cảnh (có sub)
+                    _lv_ie_raw = (_lv_sc.get("imageEffect") or _lv_sc.get("image_effect") or "").strip()
+                    _lv_ie_raw = _lv_ie_alias.get(_lv_ie_raw, _lv_ie_raw)
+                    _lv_effect = _lv_ie_raw if _lv_ie_raw in _lv_ie_valid else None
+
+                    if _lv_img_path and _lv_img_path.exists():
+                        _lv_scale_f = make_image_effect_filter(_lv_W, _lv_H, _lv_dur, effect=_lv_effect)
+                        _lv_vf = _lv_scale_f + _lv_sub_vf
+                        _lv_cmd = [
+                            "-i", str(_lv_img_path),
+                            "-i", str(_lv_audio_path),
+                            "-vf", _lv_vf,
+                            "-t", str(_lv_dur),
+                            "-c:v", "libx264", "-preset", "fast", "-crf", "22",
+                            "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+                            "-af", f"apad=whole_dur={_lv_dur}",
+                            "-pix_fmt", "yuv420p",
+                            "-map", "0:v", "-map", "1:a",
+                            "-y", str(_lv_clip_out)
+                        ]
+                    else:
+                        _lv_color = f"color=c=black:s={_lv_W}x{_lv_H}:r=30"
+                        _lv_cmd = [
+                            "-f", "lavfi", "-i", _lv_color,
+                            "-i", str(_lv_audio_path),
+                            "-vf", f"fps=30{_lv_sub_vf}",
+                            "-t", str(_lv_dur),
+                            "-c:v", "libx264", "-preset", "fast", "-crf", "22",
+                            "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+                            "-af", f"apad=whole_dur={_lv_dur}",
+                            "-pix_fmt", "yuv420p",
+                            "-map", "0:v", "-map", "1:a",
+                            "-y", str(_lv_clip_out)
+                        ]
+                    ffmpeg(*_lv_cmd)
+                    if _lv_clip_out.exists() and _lv_clip_out.stat().st_size > 1000:
+                        _lv_scene_clips.append(_lv_clip_out)
+                        # Lưu transition cho boundary này
+                        _lv_tr_raw = str(_lv_sc.get("transition","fade")).strip().lower()
+                        _lv_xfade_valid = {
+                            "fade","dissolve","wipeleft","wiperight","wipeup","wipedown",
+                            "slideleft","slideright","slideup","slidedown",
+                            "smoothleft","smoothright","smoothup","smoothdown",
+                        }
+                        _lv_tr = _lv_tr_raw if _lv_tr_raw in _lv_xfade_valid else "fade"
+                        _lv_transitions.append(_lv_tr)
+                        _lv_log(f"  ✅ Render OK ({_lv_dur}s) | transition: {_lv_tr}")
+                    else:
+                        raise RuntimeError("Output file empty or missing")
+
+                except Exception as _lv_err:
+                    _lv_log(f"  ❌ Cảnh {_lv_i+1} lỗi: {_lv_err} — skip")
+                    _lv_errors.append(_lv_i + 1)
+
+            # ── Concat với xfade per-scene ─────────────────────────────────
+            _lv_prog.progress(92, text="Ghép video với xfade...")
+            _lv_log(f"\n🎬 Ghép {len(_lv_scene_clips)} clip...")
+
+            if _lv_scene_clips:
+                _lv_xd = float(lv_xfade_dur)
+                _lv_out_dir_p = Path(lv_out_dir.strip()) if lv_out_dir.strip() else AUDIO_DIR
+                _lv_out_dir_p.mkdir(parents=True, exist_ok=True)
+                _lv_stem = output_file_stem(lv_out_name) or "video_dai"
+                _lv_final = _lv_out_dir_p / f"{_lv_stem}.mp4"
+
+                if len(_lv_scene_clips) == 1 or _lv_xd == 0:
+                    # Concat thô nếu chỉ 1 clip hoặc xfade=0
+                    _lv_concat_list = _lv_work_dir / "concat.txt"
+                    with open(_lv_concat_list, "w") as _cf:
+                        for _cp in _lv_scene_clips:
+                            _cf.write(f"file '{_cp.as_posix()}'\n")
+                    ffmpeg("-f","concat","-safe","0","-i",str(_lv_concat_list),"-c","copy","-y",str(_lv_final))
+                else:
+                    # Xfade filter_complex per-boundary
+                    def _lv_probe_dur(path):
+                        try:
+                            pb = subprocess.run([FFMPEG,"-i",str(path),"-f","null","-"],capture_output=True,text=True)
+                            for ln in pb.stderr.split("\n"):
+                                if "Duration:" in ln:
+                                    ts = ln.split("Duration:")[1].split(",")[0].strip()
+                                    hh,mm,ss = ts.split(":")
+                                    return int(hh)*3600+int(mm)*60+float(ss)
+                        except Exception:
+                            pass
+                        return 0.0
+
+                    _lv_n = len(_lv_scene_clips)
+                    _lv_durs = [max(_lv_probe_dur(c), 1.0) for c in _lv_scene_clips]
+                    _lv_inputs = []
+                    for _cp in _lv_scene_clips:
+                        _lv_inputs.extend(["-i", str(_cp)])
+
+                    _lv_fparts = []
+                    for _j in range(_lv_n):
+                        _lv_fparts.append(f"[{_j}:v]copy[v{_j}]")
+
+                    _lv_offset = _lv_durs[0] - _lv_xd
+                    _lv_cur_v = "[v0]"
+                    for _j in range(1, _lv_n):
+                        _lv_nv = f"[xv{_j}]" if _j < _lv_n-1 else "[vout]"
+                        _lv_tr_j = _lv_transitions[_j-1] if (_j-1) < len(_lv_transitions) else "fade"
+                        _lv_fparts.append(f"{_lv_cur_v}[v{_j}]xfade=transition={_lv_tr_j}:duration={_lv_xd}:offset={_lv_offset:.3f}{_lv_nv}")
+                        _lv_cur_v = _lv_nv
+                        if _j < _lv_n-1:
+                            _lv_offset += _lv_durs[_j] - _lv_xd
+
+                    # Audio: trim xfade_dur cuối mỗi clip trung gian → tổng audio = tổng video
+                    for _j in range(_lv_n):
+                        if _j < _lv_n - 1:
+                            _lv_trim_end = max(0.1, _lv_durs[_j] - _lv_xd)
+                            _lv_fparts.append(f"[{_j}:a]atrim=0:{_lv_trim_end:.3f},asetpts=PTS-STARTPTS[la{_j}]")
+                        else:
+                            _lv_fparts.append(f"[{_j}:a]acopy[la{_j}]")
+                    _lv_a_inputs = "".join(f"[la{_j}]" for _j in range(_lv_n))
+                    _lv_fparts.append(f"{_lv_a_inputs}concat=n={_lv_n}:v=0:a=1[aout]")
+
+                    _lv_xfade_out = _lv_work_dir / "xfade_out.mp4"
+                    try:
+                        ffmpeg(*_lv_inputs,"-filter_complex",";".join(_lv_fparts),
+                               "-map","[vout]","-map","[aout]",
+                               "-c:v","libx264","-preset","fast","-crf","20",
+                               "-c:a","aac","-b:a","128k","-ar","44100",
+                               "-movflags","+faststart","-y",str(_lv_xfade_out))
+                        if _lv_xfade_out.exists() and _lv_xfade_out.stat().st_size > 10000:
+                            import shutil as _shu; _shu.copy2(str(_lv_xfade_out), str(_lv_final))
+                            _lv_log("✅ Xfade concat OK")
+                        else:
+                            raise RuntimeError("output rỗng")
+                    except Exception as _lv_xe:
+                        _lv_log(f"⚠️ Xfade lỗi: {_lv_xe} — fallback concat thô")
+                        _lv_concat_list = _lv_work_dir / "concat.txt"
+                        with open(_lv_concat_list,"w") as _cf:
+                            for _cp in _lv_scene_clips: _cf.write(f"file '{_cp.as_posix()}'\n")
+                        ffmpeg("-f","concat","-safe","0","-i",str(_lv_concat_list),"-c","copy","-y",str(_lv_final))
+
+                # ── Mix BGM nếu có ───────────────────────────────────────────
+                if _lv_bgm_path and _lv_bgm_path.exists() and _lv_final.exists():
+                    _lv_prog.progress(96, text="Mix nhạc nền...")
+                    _lv_log("🎵 Mix BGM...")
+                    _lv_bgm_vol_f = lv_bgm_vol / 100.0
+                    _lv_bgm_out = _lv_out_dir_p / f"{_lv_stem}_bgm.mp4"
+                    try:
+                        ffmpeg("-i",str(_lv_final),
+                               "-stream_loop","-1","-i",str(_lv_bgm_path),
+                               "-filter_complex",
+                               f"[0:a]volume=1.0[tts];"
+                               f"[1:a]volume={_lv_bgm_vol_f}[bgm];"
+                               f"[tts][bgm]amix=inputs=2:duration=first:dropout_transition=2[aout]",
+                               "-map","0:v","-map","[aout]",
+                               "-c:v","copy","-c:a","aac","-b:a","192k",
+                               "-shortest","-y",str(_lv_bgm_out))
+                        if _lv_bgm_out.exists():
+                            import shutil as _shu2; _shu2.move(str(_lv_bgm_out), str(_lv_final))
+                            _lv_log("✅ Mix BGM OK")
+                    except Exception as _bg: _lv_log(f"⚠️ BGM lỗi: {_bg}")
+
+                _lv_prog.progress(100, text="✅ Hoàn tất!")
+                st.session_state.lv_final_path = str(_lv_final)
+                _lv_log(f"\n🎉 XONG! File: {_lv_final}")
+                if _lv_errors:
+                    _lv_log(f"⚠️ Cảnh lỗi/skip: {_lv_errors}")
+            else:
+                _lv_log("❌ Không có clip nào render thành công.")
+                st.error("Render thất bại — xem log bên dưới.")
+
+        # ── Log hiển thị sau render ───────────────────────────────────────────
+        if st.session_state.lv_render_log and not lv_do_render:
+            st.text_area("📋 Log lần render trước:", "\n".join(st.session_state.lv_render_log), height=200, key="lv_log_prev")
+
+        # ── Download ─────────────────────────────────────────────────────────
+        if st.session_state.lv_final_path and Path(st.session_state.lv_final_path).exists():
+            _lv_fp = Path(st.session_state.lv_final_path)
+            _lv_mb = _lv_fp.stat().st_size / 1024 / 1024
+            st.success(f"🎉 Video hoàn tất! ({_lv_mb:.1f} MB) — {_lv_fp.name}")
+            st.video(_lv_fp.read_bytes())
+            st.download_button(
+                label=f"⬇️ Tải xuống {_lv_fp.name}",
+                data=_lv_fp.read_bytes(),
+                file_name=_lv_fp.name,
+                mime="video/mp4",
+                use_container_width=True,
+                key="lv_download"
+            )
+
+# ════════════════════════════════════════════════════════════
+# SHORT VIDEO TAB — Import JSON → Upload ảnh → Render nhanh
+# ════════════════════════════════════════════════════════════
+with tab_shortvideo:
+    st.header("⚡ Video Ngắn — Import JSON")
+    st.caption("Paste JSON kịch bản → Upload ảnh (scene_001.jpg...) → Render video ngắn với hiệu ứng per-scene.")
+
+    # ── Session state (prefix sv_) ───────────────────────────────────────────
+    if "sv_scenes" not in st.session_state:
+        st.session_state.sv_scenes = []
+    if "sv_video_config" not in st.session_state:
+        st.session_state.sv_video_config = {}
+    if "sv_title" not in st.session_state:
+        st.session_state.sv_title = ""
+    if "sv_tts_rate" not in st.session_state:
+        st.session_state.sv_tts_rate = "1.4"
+    if "sv_aspect" not in st.session_state:
+        st.session_state.sv_aspect = "9:16"
+    if "sv_render_log" not in st.session_state:
+        st.session_state.sv_render_log = []
+    if "sv_final_path" not in st.session_state:
+        st.session_state.sv_final_path = None
+
+    # ── Helper: match ảnh theo prefix scene_NNN ──────────────────────────────
+    def _sv_scene_num(fname: str):
+        m = re.search(r'scene[_\-]?(\d+)', fname, re.IGNORECASE)
+        return int(m.group(1)) if m else None
+
+    def _sv_match_images(uploaded_files, n_scenes):
+        result = {i: None for i in range(n_scenes)}
+        no_num = []
+        for f in uploaded_files:
+            n = _sv_scene_num(f.name)
+            if n is not None:
+                idx = n - 1
+                if 0 <= idx < n_scenes:
+                    result[idx] = f
+            else:
+                no_num.append(f)
+        leftover = [i for i in range(n_scenes) if result[i] is None]
+        for f, slot in zip(no_num, leftover):
+            result[slot] = f
+        return result
+
+    # ── Image effect alias map ────────────────────────────────────────────────
+    _SV_IE_ALIAS = {
+        "slide_right":"pan_right", "slide_left":"pan_left",
+        "slide_up":"pan_up",       "slide_down":"pan_down",
+        "ken_burns":"zoom_in",     "ken_burns_in":"zoom_in",
+        "ken_burns_out":"zoom_out","zoomin":"zoom_in",
+        "zoomout":"zoom_out",      "zoom":"zoom_in",
+    }
+    _SV_IE_VALID = {"zoom_in", "zoom_out", "pan_right", "pan_left", "pan_up", "pan_down"}
+
+    # Valid xfade transitions FFmpeg hỗ trợ
+    _SV_XFADE_VALID = {
+        "fade", "dissolve", "wipeleft", "wiperight", "wipeup", "wipedown",
+        "slideleft", "slideright", "slideup", "slidedown",
+        "smoothleft", "smoothright", "smoothup", "smoothdown",
+        "circlecrop", "rectcrop", "distance", "radial",
+        "horzopen", "horzclose", "vertopen", "vertclose",
+        "diagtl", "diagtr", "diagbl", "diagbr",
+        "hlslice", "hrslice", "vuslice", "vdslice",
+        "pixelize", "squeezeh", "squeezev", "zoomin",
+    }
+
+    # ════════ A. IMPORT JSON ═══════════════════════════════════════════════
+    st.subheader("① Nhập JSON kịch bản")
+    sv_json_raw = st.text_area(
+        "Paste JSON:",
+        height=180,
+        placeholder='{"video_config":{"aspect_ratio":"9:16","tts_speed":1.4},"scenes":[{"id":1,"text":"...","duration":3,"image_effect":"slide_left","transition":"wipeleft","soundEffect":"fast_whoosh"}]}',
+        key="sv_json_input"
+    )
+
+    _sv_col_load, _sv_col_clear = st.columns([1, 1])
+    with _sv_col_load:
+        if st.button("📥 Load JSON", key="sv_btn_load", use_container_width=True):
+            try:
+                _sv_data = json.loads(sv_json_raw)
+                _sv_sc = _sv_data.get("scenes") or _sv_data.get("Scenes") or []
+                if not _sv_sc:
+                    st.error("Không tìm thấy field 'scenes' trong JSON.")
+                else:
+                    st.session_state.sv_scenes = _sv_sc
+                    _sv_vc = _sv_data.get("video_config", {})
+                    st.session_state.sv_video_config = _sv_vc
+                    st.session_state.sv_title = _sv_data.get("title", _sv_vc.get("topic", "video_ngan"))
+                    _sv_spd = str(_sv_vc.get("tts_speed") or _sv_vc.get("tts_rate") or "1.4")
+                    st.session_state.sv_tts_rate = _sv_spd
+                    st.session_state.sv_aspect = _sv_vc.get("aspect_ratio", "9:16")
+                    st.session_state.sv_final_path = None
+                    st.session_state.sv_render_log = []
+                    _sv_total = sum(s.get("duration", 3) for s in _sv_sc)
+                    st.success(f"✅ Đã load {len(_sv_sc)} cảnh — tổng ~{_sv_total:.1f}s")
+            except Exception as _sve:
+                st.error(f"❌ Lỗi parse JSON: {_sve}")
+    with _sv_col_clear:
+
+        if st.button("🗑️ Xóa", key="sv_btn_clear", use_container_width=True):
+            st.session_state.sv_scenes = []
+            st.session_state.sv_final_path = None
+            st.session_state.sv_render_log = []
+            st.rerun()
+
+    sv_scenes = st.session_state.sv_scenes
+    n_sv = len(sv_scenes)
+
+    if n_sv > 0:
+        # Preview bảng scenes
+        _sv_total_dur = sum(s.get("duration", 3) for s in sv_scenes)
+        with st.expander(f"📋 Preview {n_sv} cảnh (tổng ~{_sv_total_dur:.1f}s)", expanded=True):
+            _sv_tbl = []
+            for _svi, _svsc in enumerate(sv_scenes):
+                _sv_ie_raw = (_svsc.get("imageEffect") or _svsc.get("image_effect") or "—")
+                _sv_tr = _svsc.get("transition", "fade")
+                _sv_sfx = _svsc.get("soundEffect", "none")
+                _sv_tbl.append({
+                    "#": _svi + 1,
+                    "Text (50 chars)": str(_svsc.get("text", ""))[:50],
+                    "Dur (s)": _svsc.get("duration", 3),
+                    "image_effect": _sv_ie_raw,
+                    "transition": _sv_tr,
+                    "soundEffect": _sv_sfx,
+                    "tts_speed": _svsc.get("tts_speed", "—"),
+                })
+            st.dataframe(_sv_tbl, use_container_width=True, height=300)
+
+        st.divider()
+
+        # ════════ B. UPLOAD ẢNH ══════════════════════════════════════════
+        st.subheader("② Upload ảnh cho các cảnh")
+        st.caption("Đặt tên file: `scene_001.jpg`, `scene_002.jpg`... Tool tự map đúng cảnh.")
+
+        # Khởi tạo counter để reset uploader
+        if "sv_img_uploader_key" not in st.session_state:
+            st.session_state["sv_img_uploader_key"] = 0
+
+        _sv_up_col1, _sv_up_col2 = st.columns([6, 1])
+        with _sv_up_col1:
+            sv_uploaded_imgs = st.file_uploader(
+                f"Upload ảnh ({n_sv} cảnh — scene_NNN_...jpg):",
+                type=["jpg", "jpeg", "png", "webp"],
+                accept_multiple_files=True,
+                key=f"sv_img_uploader_{st.session_state['sv_img_uploader_key']}"
+            )
+        with _sv_up_col2:
+            st.write("")
+            st.write("")
+            if st.button("🗑️ Xóa hết", key="sv_clear_imgs", help="Xóa toàn bộ ảnh đã upload", use_container_width=True):
+                st.session_state["sv_img_uploader_key"] += 1
+                st.rerun()
+
+        sv_img_map = {}
+        if sv_uploaded_imgs:
+            sv_img_map = _sv_match_images(sv_uploaded_imgs, n_sv)
+            _sv_matched = sum(1 for v in sv_img_map.values() if v is not None)
+            _sv_unmatched = n_sv - _sv_matched
+            st.success(f"✅ Khớp {_sv_matched}/{n_sv} cảnh với ảnh.")
+            if _sv_unmatched > 0:
+                st.warning(f"⚠️ {_sv_unmatched} cảnh chưa có ảnh → sẽ dùng nền đen.")
+
+            with st.expander("📌 Bảng phân phối ảnh → cảnh", expanded=False):
+                _sv_map_rows = []
+                for _smi in range(n_sv):
+                    _svf = sv_img_map.get(_smi)
+                    _sv_map_rows.append({
+                        "Cảnh": _smi + 1,
+                        "Text": str(sv_scenes[_smi].get("text", ""))[:35],
+                        "File ảnh": _svf.name if _svf else "—",
+                        "Status": "✅ Khớp" if _svf else "⬛ Nền đen"
+                    })
+                st.dataframe(_sv_map_rows, use_container_width=True)
+        else:
+            st.info("ℹ️ Chưa upload ảnh → toàn bộ cảnh sẽ dùng nền đen.")
+
+        st.divider()
+
+        # ════════ C. CẤU HÌNH ════════════════════════════════════════════
+        st.subheader("③ Cấu hình")
+        _sv_c1, _sv_c2, _sv_c3 = st.columns(3)
+        with _sv_c1:
+            _sv_voice_opts = []
+            # ── ZeroTTS (ưu tiên đầu danh sách — local, offline, WER 1.03%) ─────
+            if _ZEROTTS_OK:
+                _sv_voice_opts.extend(_zt.list_display_voices())
+            # ── CapCut TTS ────────────────────────────────────────────────────────
+            if _CAPCUT_OK:
+                _sv_voice_opts.extend([k for k in _cc.CAPCUT_VOICES if "🇻🇳" in k])
+            _sv_voice_opts.extend(list(EDGE_VOICES.keys()))
+
+            # Default: ZeroTTS Hà My (biểu cảm, phù hợp video ngắn)
+            _sv_def_idx = 0
+            _sv_zt_default = "🇻🇳 Hà My — Nữ · Trẻ · Hoạt hình · Cao · Biểu cảm"
+            if _sv_zt_default in _sv_voice_opts:
+                _sv_def_idx = _sv_voice_opts.index(_sv_zt_default)
+            elif "🇻🇳 Giọng Nam Trầm" in _sv_voice_opts:
+                _sv_def_idx = _sv_voice_opts.index("🇻🇳 Giọng Nam Trầm")
+
+            sv_voice_key = st.selectbox(
+                "🎙️ Giọng TTS:",
+                options=_sv_voice_opts,
+                index=_sv_def_idx,
+                key="sv_voice",
+                help="⚡ ZeroTTS: offline · WER 1.03% · 8 giọng Việt có tag rõ ràng"
+            )
+        with _sv_c2:
+            _sv_speed_opts = ["0.8","0.9","1.0","1.1","1.2","1.3","1.4","1.5","1.6","1.7","1.8","2.0"]
+            sv_tts_rate = st.selectbox(
+                "⚡ Tốc độ TTS (mặc định):",
+                options=_sv_speed_opts,
+                index=_sv_speed_opts.index(st.session_state.sv_tts_rate) if st.session_state.sv_tts_rate in _sv_speed_opts else 6,
+                key="sv_tts_rate_sel",
+                on_change=lambda: st.session_state.update({"sv_tts_rate": st.session_state["sv_tts_rate_sel"]})
+            )
+        with _sv_c3:
+            sv_aspect = st.selectbox(
+                "📐 Tỉ lệ:",
+                options=["9:16", "16:9", "1:1"],
+                index=["9:16","16:9","1:1"].index(st.session_state.sv_aspect) if st.session_state.sv_aspect in ["9:16","16:9","1:1"] else 0,
+                key="sv_aspect_sel"
+            )
+
+        _sv_c4, _sv_c5 = st.columns(2)
+        with _sv_c4:
+            sv_xfade_dur = st.slider("⏱️ Xfade duration (giây):", 0.1, 1.0, 0.35, 0.05, key="sv_xfade_dur")
+        with _sv_c5:
+            sv_fade_scene = st.slider("🌒 Fade in/out mỗi cảnh (giây):", 0.0, 0.6, 0.35, 0.05, key="sv_fade_scene")
+
+        _sv_sub_c1, _sv_sub_c2 = st.columns([1, 2])
+        with _sv_sub_c1:
+            sv_show_sub = st.checkbox("📝 Hiện subtitle", value=True, key="sv_show_sub")
+        with _sv_sub_c2:
+            sv_sub_style = st.selectbox(
+                "Style sub:",
+                options=list(SUB_STYLES.keys()),
+                index=0,
+                key="sv_sub_style",
+                disabled=not sv_show_sub
+            ) if sv_show_sub else list(SUB_STYLES.keys())[0]
+
+        sv_bgm_file = st.file_uploader("🎵 Nhạc nền BGM (mp3/wav, tùy chọn):", type=["mp3","wav","m4a"], key="sv_bgm")
+        sv_bgm_vol = st.slider("🔊 Volume BGM:", 0, 100, 20, key="sv_bgm_vol") if sv_bgm_file else 20
+
+        sv_out_name = st.text_input(
+            "💾 Tên file output:",
+            value=output_file_stem(st.session_state.sv_title) or "video_ngan",
+            key="sv_out_name"
+        )
+        sv_out_dir = st.text_input(
+            "📂 Thư mục lưu video:",
+            value="/Users/zeworkcomputer/Documents/99999",
+            placeholder="/Users/zeworkcomputer/Documents/99999",
+            key="sv_out_dir",
+            help="Video final sẽ được lưu vào thư mục này. Tool tự tạo nếu chưa có."
+        )
+
+        st.divider()
+
+        # ════════ D. RENDER ═══════════════════════════════════════════════
+        st.subheader("④ Render Video Ngắn")
+        st.caption(f"Tổng thời lượng ước tính: **{_sv_total_dur:.1f}s** | {n_sv} cảnh | Xfade: {sv_xfade_dur}s per-scene")
+
+        # ── Gợi ý số từ/cảnh theo tốc độ TTS hiện tại ───────────────────
+        try:
+            _sv_rate_calc = float(st.session_state.get("sv_tts_rate", sv_tts_rate) or "1.0")
+        except Exception:
+            _sv_rate_calc = 1.0
+        _sv_xd_calc = float(sv_xfade_dur)
+        _sv_base_wps = 3.2  # Vietnamese ZeroTTS ~3.2 từ/giây ở 1x
+        _sv_eff_wps = _sv_base_wps * _sv_rate_calc
+        _avg_dur = (_sv_total_dur / max(n_sv, 1)) if n_sv > 0 else 5.0
+        _sv_words_rec = max(1, int((_avg_dur - _sv_xd_calc) * _sv_eff_wps))
+        with st.expander(f"💡 Gợi ý số từ/cảnh (rate={_sv_rate_calc}x)", expanded=False):
+            st.markdown(f"""
+**Công thức:** `từ/cảnh = (duration − xfade) × 3.2 × rate`
+
+| Duration cảnh | Rate {_sv_rate_calc}x | Từ tối đa |
+|---|---|---|
+| 3s | {_sv_rate_calc}x | **{max(1,int((3-_sv_xd_calc)*_sv_eff_wps))} từ** |
+| 4s | {_sv_rate_calc}x | **{max(1,int((4-_sv_xd_calc)*_sv_eff_wps))} từ** |
+| 5s | {_sv_rate_calc}x | **{max(1,int((5-_sv_xd_calc)*_sv_eff_wps))} từ** |
+| 6s | {_sv_rate_calc}x | **{max(1,int((6-_sv_xd_calc)*_sv_eff_wps))} từ** |
+
+→ Với cảnh trung bình **{_avg_dur:.1f}s** hiện tại: tối đa **~{_sv_words_rec} từ/cảnh**
+""")
+
+
+        sv_do_render = st.button(
+            f"▶️ Render Video Ngắn ({n_sv} cảnh)",
+            key="sv_btn_render",
+            type="primary",
+            use_container_width=True,
+            disabled=(n_sv == 0)
+        )
+
+        if sv_do_render:
+            st.session_state.sv_render_log = []
+            st.session_state.sv_final_path = None
+
+            _sv_W, _sv_H = (1080, 1920) if "9:16" in sv_aspect else ((1080, 1080) if "1:1" in sv_aspect else (1920, 1080))
+            _sv_work = AUDIO_DIR / f"sv_{uuid.uuid4().hex[:8]}"
+            _sv_work.mkdir(parents=True, exist_ok=True)
+
+            # Save BGM
+            _sv_bgm_path = None
+            if sv_bgm_file:
+                _sv_bgm_path = _sv_work / f"bgm_{sv_bgm_file.name}"
+                _sv_bgm_path.write_bytes(sv_bgm_file.read())
+
+            _sv_log_area = st.empty()
+            _sv_prog = st.progress(0, text="Đang chuẩn bị...")
+            _sv_clips = []          # list of Path
+            _sv_is_img = []          # list of bool (luôn True vì toàn ảnh)
+            _sv_transitions = []     # list of transition string per boundary
+            _sv_actual_durs = []     # actual TTS audio dur per clip (before buffer)
+            _sv_errors = []
+
+
+            def _sv_log(msg):
+                st.session_state.sv_render_log.append(msg)
+                _sv_log_area.text_area(
+                    "📋 Log:",
+                    "\n".join(st.session_state.sv_render_log[-40:]),
+                    height=220,
+                    key=f"sv_log_{len(st.session_state.sv_render_log)}"
+                )
+
+            # Log debug info
+            _sv_log(f"🔧 HAS_SUB={HAS_SUB} | show_sub={sv_show_sub} | FFMPEG={FFMPEG}")
+
+            # ── Probe duration helper ─────────────────────────────────────
+            def _sv_probe_dur(path):
+                try:
+                    pb = subprocess.run(
+                        [FFMPEG, "-i", str(path), "-f", "null", "-"],
+                        capture_output=True, text=True
+                    )
+                    for ln in pb.stderr.split("\n"):
+                        if "Duration:" in ln:
+                            ts = ln.split("Duration:")[1].split(",")[0].strip()
+                            hh, mm, ss = ts.split(":")
+                            return int(hh)*3600 + int(mm)*60 + float(ss)
+                except Exception:
+                    pass
+                return 0.0
+
+            # ── Per-scene render loop ─────────────────────────────────────
+            for _svi, _svsc in enumerate(sv_scenes):
+                _sv_pct = int(_svi / n_sv * 88)
+                _sv_prog.progress(_sv_pct, text=f"Cảnh {_svi+1}/{n_sv}...")
+                _sv_log(f"━━ Cảnh {_svi+1}/{n_sv}: {str(_svsc.get('text',''))[:45]}")
+
+                _sv_s_dir = _sv_work / f"scene_{_svi:04d}"
+                _sv_s_dir.mkdir(exist_ok=True)
+                _sv_clip_out = _sv_s_dir / "clip.mp4"
+
+                try:
+                    # ── Step 1: TTS ───────────────────────────────────────
+                    _sv_text = str(_svsc.get("text", "")).strip()
+                    _sv_dur  = float(_svsc.get("duration", 3))
+                    # Per-scene tts_speed ưu tiên; fallback về global sv_tts_rate
+                    # UI global rate luôn được ưu tiên; per-scene tts_speed trong JSON chỉ dùng khi UI rate = default
+                    _sv_sc_rate = sv_tts_rate
+                    _sv_audio = _sv_s_dir / "tts.mp3"
+                    _sv_srt   = _sv_s_dir / "tts.srt"
+                    _sv_log(f"  🎙️ TTS '{_sv_text[:30]}' (speed={_sv_sc_rate}x)...")
+                    _sv_words = []
+                    try:
+                        _sv_tts_result = tts(
+                            _sv_text, voice_cfg=sv_voice_key, srt_out=str(_sv_srt), rate=_sv_sc_rate
+                        )
+                        if _sv_tts_result and Path(_sv_tts_result).exists():
+                            shutil.move(_sv_tts_result, str(_sv_audio))
+                        # Lấy words từ SRT file nếu tạo được
+                        if _sv_srt.exists() and _sv_srt.stat().st_size > 10:
+                            _sv_words = srt_to_words(str(_sv_srt))
+                            _sv_log(f"  ✅ TTS OK — {len(_sv_words)} words từ SRT")
+                        else:
+                            _sv_log("  ⚠️ SRT rỗng — tạo words từ text + duration")
+                    except Exception as _svte:
+                        _sv_log(f"  ⚠️ TTS lỗi: {_svte} — dùng silence")
+                        ffmpeg("-f","lavfi","-i",f"anullsrc=r=44100:cl=mono",
+                               "-t",str(_sv_dur),"-acodec","libmp3lame","-y",str(_sv_audio))
+
+                    # Fallback: nếu không có words từ SRT, tạo timing đều từ text
+                    if not _sv_words and _sv_text and _sv_audio.exists():
+                        try:
+                            _sv_probe_audio = subprocess.run(
+                                [FFMPEG, "-i", str(_sv_audio), "-f", "null", "-"],
+                                capture_output=True, text=True
+                            )
+                            _sv_aud_dur = 0.0
+                            for _svln in _sv_probe_audio.stderr.split("\n"):
+                                if "Duration:" in _svln:
+                                    _svts = _svln.split("Duration:")[1].split(",")[0].strip()
+                                    _svh, _svm, _svs = _svts.split(":")
+                                    _sv_aud_dur = int(_svh)*3600 + int(_svm)*60 + float(_svs)
+                                    break
+                            if _sv_aud_dur > 0:
+                                # Detect leading silence — find when speech actually starts
+                                _sv_speech_start = 0.0
+                                try:
+                                    _sv_sil = subprocess.run(
+                                        [FFMPEG, "-i", str(_sv_audio),
+                                         "-af", "silencedetect=noise=-35dB:d=0.05",
+                                         "-f", "null", "-"],
+                                        capture_output=True, text=True
+                                    )
+                                    for _sil_ln in _sv_sil.stderr.split("\n"):
+                                        if "silence_end:" in _sil_ln:
+                                            _sv_speech_start = float(_sil_ln.split("silence_end:")[1].split("|")[0].strip())
+                                            break
+                                except Exception:
+                                    pass
+                                _sv_speech_dur = max(0.1, _sv_aud_dur - _sv_speech_start)
+                                _sv_toks = _sv_text.split()
+                                _sv_td = _sv_speech_dur / max(len(_sv_toks), 1)
+                                _sv_words = [
+                                    {"word": w, "start": _sv_speech_start + i*_sv_td, "end": _sv_speech_start + (i+1)*_sv_td}
+                                    for i, w in enumerate(_sv_toks)
+                                ]
+                                _sv_log(f"  📝 Fallback words: {len(_sv_words)} từ (speech_start={_sv_speech_start:.2f}s, speech_dur={_sv_speech_dur:.2f}s)")
+                        except Exception as _svwe:
+                            _sv_log(f"  ⚠️ Fallback words lỗi: {_svwe}")
+
+                    # ── Step 1b: Tạo subtitle ASS nếu cần ───────────────────────
+                    _sv_ass_path = None
+                    _sv_log(f"  🔍 sub check: show={sv_show_sub} HAS_SUB={HAS_SUB} words={len(_sv_words)}")
+                    if sv_show_sub and HAS_SUB and _sv_words:
+                        try:
+                            _sv_ass_content = make_ass(
+                                _sv_words, W=_sv_W, H=_sv_H,
+                                style_name=sv_sub_style
+                            )
+                            if _sv_ass_content:
+                                _sv_ass_path = _sv_s_dir / "sub.ass"
+                                _sv_ass_path.write_text(_sv_ass_content, encoding="utf-8")
+                                _sv_log(f"  📝 Sub ASS OK ({len(_sv_words)} words) → {_sv_ass_path.name}")
+                            else:
+                                _sv_log("  ⚠️ make_ass trả về rỗng")
+                        except Exception as _sv_asse:
+                            _sv_log(f"  ⚠️ Sub lỗi: {_sv_asse} — bỏ phụ đề")
+                    elif sv_show_sub and not HAS_SUB:
+                        _sv_log("  ⚠️ FFmpeg thiếu libass — bỏ phụ đề")
+                    elif sv_show_sub and not _sv_words:
+                        _sv_log("  ⚠️ words rỗng — không có timing để tạo sub")
+
+                    # ── Step 2: Ảnh ───────────────────────────────────────
+                    _sv_img_path = None
+                    _sv_upf = sv_img_map.get(_svi) if sv_img_map else None
+                    if _sv_upf is not None:
+                        _sv_img_save = _sv_s_dir / f"img_{_sv_upf.name}"
+                        _sv_img_save.write_bytes(_sv_upf.read())
+                        _sv_img_path = _sv_img_save
+                        _sv_log(f"  🖼️ Ảnh: {_sv_upf.name}")
+                    else:
+                        _sv_log(f"  ⬛ Không có ảnh — nền đen")
+
+                    # ── Step 3: Resolve image_effect ─────────────────────
+                    _sv_ie_raw = (_svsc.get("imageEffect") or _svsc.get("image_effect") or "").strip()
+                    _sv_ie_raw = _SV_IE_ALIAS.get(_sv_ie_raw, _sv_ie_raw)
+                    _sv_effect = _sv_ie_raw if _sv_ie_raw in _SV_IE_VALID else None
+                    _sv_log(f"  🎨 image_effect: {_sv_effect or 'random'}")
+
+                    # ── Step 4: FFmpeg render cảnh ────────────────────────
+                    # Probe audio thực tế sau TTS — dùng làm clip duration
+                    # để sub/video sync đúng dù TTS chạy ở tốc độ bất kỳ
+                    _sv_actual_dur = _sv_dur  # default = JSON duration
+                    if _sv_audio.exists() and _sv_audio.stat().st_size > 1000:
+                        try:
+                            _sv_ap = subprocess.run(
+                                [FFMPEG, "-i", str(_sv_audio), "-f", "null", "-"],
+                                capture_output=True, text=True
+                            )
+                            for _svl in _sv_ap.stderr.split("\n"):
+                                if "Duration:" in _svl:
+                                    _svt = _svl.split("Duration:")[1].split(",")[0].strip()
+                                    _svh2, _svm2, _svs2 = _svt.split(":")
+                                    _sv_actual_dur = int(_svh2)*3600 + int(_svm2)*60 + float(_svs2)
+                                    _sv_log(f"  ⏱️ Audio thực tế: {_sv_actual_dur:.2f}s (JSON: {_sv_dur}s)")
+                                    break
+                        except Exception as _svdp:
+                            _sv_log(f"  ⚠️ Probe audio dur lỗi: {_svdp} — dùng {_sv_dur}s")
+
+                    # Clip duration = audio thực tế + buffer xfade_dur
+                    # Buffer = silence padding sau voice → atrim sau này chỉ cắt silence, không cắt voice
+                    _sv_xfade_buf = float(sv_xfade_dur)
+                    _sv_clip_dur = _sv_actual_dur + _sv_xfade_buf
+
+                    _sv_fd = float(sv_fade_scene)
+                    _sv_fade_vf = f",fade=t=in:st=0:d={_sv_fd},fade=t=out:st={max(0.0, _sv_clip_dur - _sv_fd):.3f}:d={_sv_fd}" if _sv_fd > 0 else ""
+
+                    # Subtitle ASS filter — cần format=yuv420p trước ass=
+                    # vì libass cần yuv420p, mà zoompan output có thể khác
+                    def _sv_ass_filter(ass_path):
+                        p = str(ass_path).replace("\\", "\\\\").replace(":", "\\:")
+                        return f",format=yuv420p,ass='{p}'"
+
+                    _sv_sub_vf = _sv_ass_filter(_sv_ass_path) if _sv_ass_path else ""
+
+                    if _sv_img_path and _sv_img_path.exists():
+                        _sv_scale_f = make_image_effect_filter(_sv_W, _sv_H, _sv_clip_dur, effect=_sv_effect)
+                        _sv_vf = _sv_scale_f + _sv_fade_vf + _sv_sub_vf
+                        _sv_log(f"  🔧 vf: {_sv_vf[:100]}{'...' if len(_sv_vf)>100 else ''}")
+                        _sv_cmd = [
+                            "-i", str(_sv_img_path),
+                            "-i", str(_sv_audio),
+                            "-vf", _sv_vf,
+                            "-t", str(_sv_clip_dur),
+                            "-c:v", "libx264", "-preset", "fast", "-crf", "22",
+                            "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+                            "-af", f"apad=whole_dur={_sv_clip_dur}",
+                            "-pix_fmt", "yuv420p",
+                            "-map", "0:v", "-map", "1:a",
+                            "-y", str(_sv_clip_out)
+                        ]
+                    else:
+                        _sv_color = f"color=c=black:s={_sv_W}x{_sv_H}:r=30"
+                        _sv_cmd = [
+                            "-f", "lavfi", "-i", _sv_color,
+                            "-i", str(_sv_audio),
+                            "-vf", f"fps=30{_sv_fade_vf}{_sv_sub_vf}",
+                            "-t", str(_sv_clip_dur),
+                            "-c:v", "libx264", "-preset", "fast", "-crf", "22",
+                            "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+                            "-af", f"apad=whole_dur={_sv_clip_dur}",
+                            "-pix_fmt", "yuv420p",
+                            "-map", "0:v", "-map", "1:a",
+                            "-y", str(_sv_clip_out)
+                        ]
+                    ffmpeg(*_sv_cmd)
+
+                    if not (_sv_clip_out.exists() and _sv_clip_out.stat().st_size > 1000):
+                        raise RuntimeError("Clip output rỗng hoặc không tồn tại")
+
+                    # ── Step 5: Sound Effect mix ──────────────────────────
+                    # Map fast_whoosh / bright_chime → key trong SOUND_EFFECTS
+                    _sv_sfx_raw = str(_svsc.get("soundEffect", "none")).strip().lower()
+                    _sv_sfx_map = {
+                        "fast_whoosh": "whoosh",
+                        "bright_chime": "chime",
+                        "whoosh": "whoosh",
+                        "chime": "chime",
+                        "click": "click",
+                        "deep_hit": "deep_hit",
+                        "none": "none",
+                    }
+                    _sv_sfx = _sv_sfx_map.get(_sv_sfx_raw, "none")
+                    if _sv_sfx and _sv_sfx != "none" and _sv_sfx in SOUND_EFFECTS:
+                        _sv_clip_sfx = _sv_s_dir / "clip_sfx.mp4"
+                        _sv_ok = apply_sound_effect_to_scene(_sv_clip_out, _sv_sfx, _sv_clip_sfx)
+                        if _sv_ok:
+                            _sv_clip_out = _sv_clip_sfx
+                            _sv_log(f"  🔊 SFX '{_sv_sfx}' OK")
+                        else:
+                            _sv_log(f"  ⚠️ SFX '{_sv_sfx}' thất bại — bỏ qua")
+
+                    _sv_clips.append(_sv_clip_out)
+                    _sv_actual_durs.append(_sv_actual_dur)  # lưu TTS dur thực (trước buffer)
+                    _sv_is_img.append(True)  # luôn True vì toàn ảnh
+
+                    # Lưu transition của cảnh này (dùng cho boundary i → i+1)
+                    _sv_tr_raw = str(_svsc.get("transition", "fade")).strip().lower()
+                    _sv_tr = _sv_tr_raw if _sv_tr_raw in _SV_XFADE_VALID else "fade"
+                    _sv_transitions.append(_sv_tr)
+
+                    _sv_log(f"  ✅ Cảnh {_svi+1} OK ({_sv_dur}s) | transition→next: {_sv_tr}")
+
+                except Exception as _sverr:
+                    _sv_log(f"  ❌ Cảnh {_svi+1} lỗi: {_sverr}")
+                    _sv_errors.append(_svi + 1)
+
+            # ── Concat với xfade per-scene ────────────────────────────────
+            _sv_prog.progress(90, text="Ghép video với xfade...")
+            _sv_log(f"\n🎬 Ghép {len(_sv_clips)} clip (xfade per-scene)...")
+
+            _sv_raw_out = None
+            if len(_sv_clips) == 0:
+                _sv_log("❌ Không có clip nào render thành công.")
+                st.error("Render thất bại — xem log bên dưới.")
+            elif len(_sv_clips) == 1:
+                _sv_raw_out = _sv_clips[0]
+            else:
+                # ── Build xfade filter_complex ────────────────────────────
+                _sv_concat_out = _sv_work / "xfade_concat.mp4"
+                _sv_n = len(_sv_clips)
+                _sv_xd = float(sv_xfade_dur)
+
+                # Probe duration của từng clip
+                _sv_durs = []
+                for _cp in _sv_clips:
+                    _d = _sv_probe_dur(_cp)
+                    _sv_durs.append(max(_d, 1.0))
+
+                # Build FFmpeg inputs
+                _sv_inputs = []
+                for _cp in _sv_clips:
+                    _sv_inputs.extend(["-i", str(_cp)])
+
+                # Build filter_complex với xfade video + concat audio thẳng
+                # Audio dùng concat (không acrossfade) để từ đầu cảnh mới rõ 100%
+                _sv_fparts = []
+                for _j in range(_sv_n):
+                    _sv_fparts.append(f"[{_j}:v]copy[v{_j}]")
+
+                _sv_offset = _sv_durs[0] - _sv_xd
+                _sv_cur_v = "[v0]"
+
+                for _j in range(1, _sv_n):
+                    _sv_nv = f"[xv{_j}]" if _j < _sv_n - 1 else "[vout]"
+                    _sv_tr_j = _sv_transitions[_j - 1] if (_j - 1) < len(_sv_transitions) else "fade"
+                    _sv_fparts.append(
+                        f"{_sv_cur_v}[v{_j}]xfade=transition={_sv_tr_j}:duration={_sv_xd}:offset={_sv_offset:.3f}{_sv_nv}"
+                    )
+                    _sv_cur_v = _sv_nv
+                    if _j < _sv_n - 1:
+                        _sv_offset += _sv_durs[_j] - _sv_xd
+
+                # Audio: atrim đến _sv_actual_durs[j] (TTS thực) — chỉ cắt buffer silence
+                # Mỗi clip được render với actual_dur + xfade_buf → buffer là silence sau voice
+                # atrim cắt đúng buffer silence, KHÔNG cắt voice content
+                _sv_adurs_safe = (
+                    _sv_actual_durs if len(_sv_actual_durs) == _sv_n
+                    else [max(0.1, d - _sv_xd) for d in _sv_durs]
+                )
+                for _j in range(_sv_n):
+                    _trim_end = max(0.1, _sv_adurs_safe[_j])
+                    _sv_fparts.append(f"[{_j}:a]atrim=0:{_trim_end:.3f},asetpts=PTS-STARTPTS[a{_j}]")
+                _sv_a_inputs = "".join(f"[a{_j}]" for _j in range(_sv_n))
+                _sv_fparts.append(f"{_sv_a_inputs}concat=n={_sv_n}:v=0:a=1[aout]")
+
+                _sv_fc = ";".join(_sv_fparts)
+                _sv_total_adur = sum(_sv_adurs_safe)  # tổng audio thực = giới hạn video
+
+                try:
+                    ffmpeg(
+                        *_sv_inputs,
+                        "-filter_complex", _sv_fc,
+                        "-map", "[vout]", "-map", "[aout]",
+                        "-t", f"{_sv_total_adur:.3f}",  # trim trailing silence buffer clip cuối
+                        "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+                        "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+                        "-movflags", "+faststart",
+                        "-y", str(_sv_concat_out)
+                    )
+
+                    if _sv_concat_out.exists() and _sv_concat_out.stat().st_size > 10000:
+                        _sv_raw_out = _sv_concat_out
+                        _sv_log("✅ Xfade concat OK")
+                    else:
+                        raise RuntimeError("Xfade output rỗng")
+                except Exception as _svxe:
+                    _sv_log(f"⚠️ Xfade lỗi: {_svxe} — fallback concat thô")
+                    # Fallback: concat thô
+                    _sv_concat_txt = _sv_work / "concat.txt"
+                    _sv_concat_txt.write_text("\n".join(f"file '{p.as_posix()}'" for p in _sv_clips))
+                    _sv_concat_fb = _sv_work / "concat_fallback.mp4"
+                    ffmpeg("-f","concat","-safe","0","-i",str(_sv_concat_txt),"-c","copy","-y",str(_sv_concat_fb))
+                    _sv_raw_out = _sv_concat_fb if _sv_concat_fb.exists() else None
+
+            # ── Mix BGM nếu có ────────────────────────────────────────────
+            if _sv_raw_out and _sv_raw_out.exists():
+                _sv_stem = output_file_stem(sv_out_name) or "video_ngan"
+                _sv_out_dir_p = Path(sv_out_dir.strip()) if sv_out_dir.strip() else AUDIO_DIR
+                _sv_out_dir_p.mkdir(parents=True, exist_ok=True)
+                _sv_final = _sv_out_dir_p / f"{_sv_stem}.mp4"
+
+                if _sv_bgm_path and _sv_bgm_path.exists():
+                    _sv_prog.progress(96, text="Mix nhạc nền...")
+                    _sv_log("🎵 Mix BGM...")
+                    _sv_bgm_volf = sv_bgm_vol / 100.0
+                    try:
+                        ffmpeg(
+                            "-i", str(_sv_raw_out),
+                            "-stream_loop", "-1", "-i", str(_sv_bgm_path),
+                            "-filter_complex",
+                            f"[0:a]volume=1.0[tts];"
+                            f"[1:a]volume={_sv_bgm_volf}[bgm];"
+                            f"[tts][bgm]amix=inputs=2:duration=first:dropout_transition=2[aout]",
+                            "-map", "0:v", "-map", "[aout]",
+                            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                            "-shortest", "-y", str(_sv_final)
+                        )
+                        _sv_log("✅ Mix BGM OK")
+                    except Exception as _svbgme:
+                        _sv_log(f"⚠️ BGM lỗi: {_svbgme} — dùng video không nhạc")
+                        import shutil as _shutil
+                        _shutil.copy2(str(_sv_raw_out), str(_sv_final))
+                else:
+                    import shutil as _shutil
+                    _shutil.copy2(str(_sv_raw_out), str(_sv_final))
+
+                _sv_prog.progress(100, text="✅ Hoàn tất!")
+                st.session_state.sv_final_path = str(_sv_final)
+                _sv_log(f"\n🎉 XONG! {_sv_final}")
+                if _sv_errors:
+                    _sv_log(f"⚠️ Cảnh bị lỗi/skip: {_sv_errors}")
+            else:
+                _sv_log("❌ Không tạo được video cuối.")
+                st.error("Render thất bại — xem log.")
+
+        # ── Log lần render trước ──────────────────────────────────────────
+        if st.session_state.sv_render_log and not sv_do_render:
+            st.text_area("📋 Log lần render trước:", "\n".join(st.session_state.sv_render_log), height=200, key="sv_log_prev")
+
+        # ── Download ──────────────────────────────────────────────────────
+        if st.session_state.sv_final_path and Path(st.session_state.sv_final_path).exists():
+            _sv_fp = Path(st.session_state.sv_final_path)
+            _sv_mb = _sv_fp.stat().st_size / 1024 / 1024
+            st.success(f"🎉 Video ngắn hoàn tất! ({_sv_mb:.1f} MB) — {_sv_fp.name}")
+            st.video(_sv_fp.read_bytes())
+            st.download_button(
+                label=f"⬇️ Tải xuống {_sv_fp.name}",
+                data=_sv_fp.read_bytes(),
+                file_name=_sv_fp.name,
+                mime="video/mp4",
+                use_container_width=True,
+                key="sv_download"
+            )
 
 # ════════════════════════════════════════════════════════════
 # SOCIAL PUBLISHING TAB — schedules and prior rendered videos
